@@ -1,0 +1,96 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+      - run: pip install -r requirements-dev.txt
+      # `ruff format` is deliberately not enforced: it collapses the column
+      # alignment in the hand-aligned protocol byte-layout tables (see
+      # _SYNC_RECORDS_CLEAR in tools/k2_simulator.py), which are meant to be
+      # read against their header comment. Linting is enforced; layout is not.
+      - name: Lint
+        run: ruff check .
+
+  test:
+    name: Test (${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # pyproject declares requires-python = ">=3.12", so every version that
+        # claim covers gets exercised.
+        python-version: ["3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+      - run: pip install -r requirements-dev.txt
+
+      # Whole repo, not just the package: tests/ and tools/ are type-checked
+      # too, and mypy results can differ between Python versions.
+      - name: Type check
+        run: mypy --strict .
+
+      - name: Run tests
+        run: pytest -v
+
+      - name: Smoke-test the stdlib-only probe
+        run: python3 tools/k2_udp_probe.py --help
+
+      - name: Smoke-test the simulator
+        run: python tools/k2_simulator.py --once
+
+  build:
+    name: Build & install
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install build twine
+
+      - name: Build sdist + wheel
+        run: python -m build
+
+      - name: Check package metadata
+        run: twine check dist/*
+
+      # pyproject lists packages explicitly, so a new subpackage can be left out
+      # of the distribution without anything else noticing. Installing the built
+      # wheel into a clean environment and importing it is what catches that.
+      - name: Install the wheel and import it
+        run: |
+          set -euo pipefail
+          python -m venv /tmp/wheeltest
+          /tmp/wheeltest/bin/pip install dist/*.whl
+          # Run from a neutral directory: at the repo root the source tree would
+          # satisfy the import and this check would pass without ever exercising
+          # the wheel.
+          cd /tmp
+          /tmp/wheeltest/bin/python -c "
+          import elro_connects_k2_protocol as p
+          from elro_connects_k2_protocol import K2Gateway, discover_gateway
+          import importlib.resources as r
+          assert 'site-packages' in p.__file__, f'not resolved from the wheel: {p.__file__}'
+          assert r.files(p).joinpath('py.typed').is_file(), 'py.typed missing from wheel'
+          print('import + py.typed OK:', p.__file__)
+          "
+          /tmp/wheeltest/bin/python -m elro_connects_k2_protocol --help

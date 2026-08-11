@@ -1,0 +1,45 @@
+{
+  "description": "CMD_CODE 55 response from live hardware session 2026-07-10. Gateway ST_1234567890 at 192.168.1.50. Three GS559A photoelectric smoke alarms as sub-devices 1, 2, 3 (type 0013). 14-char records reconstructed from confirmed deviceStatus values in protocol_reference.md. Nibble B (room id, record[7]) captured as 0 — value not in live session logs.",
+  "parser": "parse_sync_response",
+  "input": {
+    "action": "NODE_SEND",
+    "devID": "ST_1234567890",
+    "msg": {
+      "CMD_CODE": 55,
+      "data_str1": "0100134057AA55020013305FAA34",
+      "data_str2": "030013305FAA9E"
+    }
+  },
+  "expected": {
+    "1": {
+      "sub_id": 1,
+      "raw_type": "0013",
+      "device_type": "013",
+      "profile_name": "Photoelectric Smoke Alarm",
+      "signal_bars": 4,
+      "battery_pct": 87,
+      "alarm_state": "CLEAR",
+      "raw_status": "0457AA55"
+    },
+    "2": {
+      "sub_id": 2,
+      "raw_type": "0013",
+      "device_type": "013",
+      "profile_name": "Photoelectric Smoke Alarm",
+      "signal_bars": 3,
+      "battery_pct": 95,
+      "alarm_state": "CLEAR",
+      "raw_status": "035FAA34"
+    },
+    "3": {
+      "sub_id": 3,
+      "raw_type": "0013",
+      "device_type": "013",
+      "profile_name": "Photoelectric Smoke Alarm",
+      "signal_bars": 3,
+      "battery_pct": 95,
+      "alarm_state": "CLEAR",
+      "raw_status": "035FAA9E"
+    }
+  }
+}

@@ -1,0 +1,79 @@
+[build-system]
+# Build-time only: setuptools turns this tree into a wheel and is never
+# installed alongside the package (`dependencies` stays empty). The 77 floor is
+# purely for the PEP 639 `license` spelling below, which older setuptools
+# rejects; the alternative table form is deprecated and removed 2027-02-18.
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "elro-connects-k2-protocol"
+version = "0.1.0"
+description = "Local UDP protocol library for ELRO Connects K2 (SF50GA) gateways"
+readme = "README.md"
+requires-python = ">=3.12"
+# Apache-2.0 to match Home Assistant core, so the integration that consumes this
+# library stays upstreamable. No "License ::" classifier to go with it: PyPI
+# rejects uploads that declare both this and the classifier.
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [{ name = "laps" }]
+keywords = ["elro", "connects", "k2", "sf50ga", "smoke-detector", "home-assistant", "udp"]
+dependencies = []
+
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Framework :: AsyncIO",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Topic :: Home Automation",
+    "Topic :: System :: Hardware",
+    "Typing :: Typed",
+]
+
+[project.urls]
+Homepage = "https://github.com/ldebruijn/elro-connects-k2-protocol"
+Issues = "https://github.com/ldebruijn/elro-connects-k2-protocol/issues"
+Documentation = "https://github.com/ldebruijn/elro-connects-k2-protocol/blob/main/docs/protocol_reference.md"
+
+[tool.setuptools]
+# tests/ and tools/ sit next to the package, so flat-layout auto-discovery has
+# to be told which directory is the package.
+packages = ["elro_connects_k2_protocol"]
+
+[tool.setuptools.package-data]
+elro_connects_k2_protocol = ["py.typed"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.mypy]
+strict = true
+python_version = "3.12"
+
+[tool.ruff]
+line-length = 110
+target-version = "py312"
+
+[tool.ruff.lint]
+# Explicit rather than relying on ruff's defaults, so CI can't drift when ruff
+# changes what it selects out of the box.
+select = ["E", "F", "W", "I", "N", "UP", "B", "SIM", "C4", "PIE", "RET", "RUF"]
+ignore = [
+    "E501",    # line length is enforced by the formatter, not the linter
+    "RET504",  # assigning before return is often clearer with a type annotation
+    # This codebase deliberately uses typographic characters (− – × ° →) in
+    # docstrings and comments describing the wire protocol.
+    "RUF001", "RUF002", "RUF003",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# The simulator inserts the repo root on sys.path so it runs without an install.
+"tools/k2_simulator.py" = ["E402"]

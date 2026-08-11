@@ -1,0 +1,24 @@
+{
+  "description": "CMD_CODE 19 unsolicited push update. Placeholder — to be replaced with a real captured payload from the first live session that receives a push event (trigger a detector or wait for a battery/status change). Set skip=false once input and expected are filled in.",
+  "parser": "parse_push_update",
+  "skip": true,
+  "input": {
+    "action": "NODE_SEND",
+    "devID": "ST_1234567890",
+    "msg": {
+      "CMD_CODE": 19,
+      "data_str1": "PLACEHOLDER",
+      "data_str2": "PLACEHOLDER"
+    }
+  },
+  "expected": {
+    "sub_id": null,
+    "raw_type": null,
+    "device_type": null,
+    "profile_name": null,
+    "signal_bars": null,
+    "battery_pct": null,
+    "alarm_state": null,
+    "raw_status": null
+  }
+}
