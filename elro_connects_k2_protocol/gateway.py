@@ -823,10 +823,32 @@ async def discover_gateway(
     loop = asyncio.get_running_loop()
     result: asyncio.Future[tuple[str, str]] = loop.create_future()
 
+    # Built by hand rather than with local_addr= so SO_REUSEADDR can be set, as
+    # K2Gateway.connect() already does.  asyncio has not set it on UDP sockets
+    # since Python 3.8 (bpo-37228), so local_addr= raised EADDRINUSE even when
+    # the only other holder of port 1025 was one of our own sockets — a
+    # connected K2Gateway, or the not-yet-reaped socket of a previous one.
+    # Discovery run from a config flow while an entry is already set up hit
+    # exactly that.
+    #
+    # Linux shares an addr:port across UDP sockets only when *every* socket
+    # bound to it sets SO_REUSEADDR, so this deliberately does not paper over
+    # an unrelated process squatting on 1025: that still raises EADDRINUSE,
+    # which is the correct answer.  Note also that while two sockets do share
+    # the port, an inbound unicast reply is delivered to just one of them, so
+    # discovery and an active session should not be run concurrently.
+    #
+    # SO_BROADCAST replaces allow_broadcast=, which cannot be passed alongside
+    # sock= in Python 3.14+.
+    sock = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
+    sock.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
+    sock.setsockopt(_socket.SOL_SOCKET, _socket.SO_BROADCAST, 1)
+    sock.setblocking(False)
+    sock.bind(("0.0.0.0", UDP_PORT))
+
     transport, _protocol = await loop.create_datagram_endpoint(
         lambda: _DiscoveryProtocol(result),
-        local_addr=("0.0.0.0", UDP_PORT),
-        allow_broadcast=True,
+        sock=sock,
     )
 
     try:
