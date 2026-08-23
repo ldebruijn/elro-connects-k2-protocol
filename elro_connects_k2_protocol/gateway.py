@@ -108,6 +108,14 @@ _SYNC_COLLECT_SECONDS: float = 3.0
 _NAME_COLLECT_SECONDS: float = 3.0
 # How long to wait for the hub's CMD_CODE 11 ACK confirming a command was taken.
 _ACK_TIMEOUT: float = 5.0
+# How long to wait for the NODE_ACK confirming the hub processed an activation
+# ping.  Hubs have been observed answering in anywhere from 4 ms to 344 ms.
+_ACTIVATION_TIMEOUT: float = 2.0
+# How many activation pings to send before giving up and sending anyway.
+_ACTIVATION_ATTEMPTS: int = 3
+# How many times to send CMD_CODE 54 when the hub returns no status records.
+# Only ever reached when activation went unacknowledged -- see sync_devices().
+_SYNC_ATTEMPTS: int = 2
 # How long to hold a pairing window open.  Matches the vendor app's countdown
 # for adding a sub-device (DistributeNetRequest.onStartCountDown(false) → 60 s;
 # the 120 s branch is the gateway-onboarding flow, not this one).
@@ -175,6 +183,11 @@ class K2Gateway:
         self._pending_acks: dict[int, asyncio.Future[bool]] = {}
         # Pairing state: set while a CMD_CODE 2 join window is open
         self._pending_new_device: asyncio.Future[PairingResult | None] | None = None
+        # Activation state: set while a targeted IOT_KEY? awaits its NODE_ACK
+        self._activation_ack: asyncio.Future[None] | None = None
+        # True once the hub has acked an activation ping, i.e. the session is
+        # armed and the hub will act on APP_SEND rather than dropping it.
+        self._activated: bool = False
 
     # ── lifecycle ─────────────────────────────────────────────────────────────
 
@@ -212,14 +225,80 @@ class K2Gateway:
 
     # ── commands ──────────────────────────────────────────────────────────────
 
-    async def activate(self) -> None:
-        """Send a targeted IOT_KEY? directly to the gateway.
+    async def activate(self) -> bool:
+        """Send a targeted IOT_KEY? and wait for the hub to acknowledge it.
 
         The K2 ignores APP_SEND commands until it has received a targeted
-        IOT_KEY? from the controlling host. This doubles as a session keepalive.
+        IOT_KEY? from the controlling host, and it does not arm the session at
+        the moment the ping arrives but at the moment it finishes processing
+        it — the NODE_ACK is the only observable signal that this has happened.
+
+        Waiting for that ACK is what makes this correct rather than merely
+        usually-correct.  Hubs have been seen taking anywhere from 4 ms to
+        344 ms to answer, so a caller that sends its first APP_SEND immediately
+        after this returns would otherwise race ahead of activation on a slow
+        hub, and the hub drops such commands *silently* — no error, no ACK, no
+        response at all.  That failure mode looks exactly like "the hub has no
+        devices", which is precisely how it was reported.
+
+        This doubles as a session keepalive.  Returns True once the hub has
+        acked; False if it never did, in which case the caller may still try to
+        send — an un-acked ping is not proof the hub missed it.
         """
-        self._send(build_activation(self._device_name))
-        _LOGGER.debug("Sent activation ping to %s", self._ip)
+        loop = asyncio.get_running_loop()
+        # Distinguishes "the session just came up" from a routine keepalive, so
+        # the first arming is visible at INFO without the per-minute re-pings
+        # spamming the log.
+        was_activated = self._activated
+
+        for attempt in range(1, _ACTIVATION_ATTEMPTS + 1):
+            self._activation_ack = loop.create_future()
+            started = loop.time()
+            self._send(build_activation(self._device_name))
+            _LOGGER.debug(
+                "Sent activation ping to %s (attempt %d/%d)",
+                self._ip, attempt, _ACTIVATION_ATTEMPTS,
+            )
+            try:
+                await asyncio.wait_for(self._activation_ack, timeout=_ACTIVATION_TIMEOUT)
+            except TimeoutError:
+                _LOGGER.debug(
+                    "No NODE_ACK from %s within %.1f s (attempt %d/%d)%s",
+                    self._ip, _ACTIVATION_TIMEOUT, attempt, _ACTIVATION_ATTEMPTS,
+                    "; retrying" if attempt < _ACTIVATION_ATTEMPTS else "",
+                )
+                continue
+            finally:
+                self._activation_ack = None
+
+            # Worth logging even on success: this number is the hub's real
+            # processing latency, and it is what distinguishes a hub that arms
+            # comfortably from one that only just makes the timeout.
+            elapsed_ms = (loop.time() - started) * 1000
+            self._activated = True
+            if was_activated:
+                _LOGGER.debug(
+                    "Gateway %s re-acknowledged activation in %.0f ms (attempt %d/%d)",
+                    self._ip, elapsed_ms, attempt, _ACTIVATION_ATTEMPTS,
+                )
+            else:
+                _LOGGER.info(
+                    "Gateway %s activated in %.0f ms (attempt %d/%d); session is armed "
+                    "and the hub will now accept commands",
+                    self._ip, elapsed_ms, attempt, _ACTIVATION_ATTEMPTS,
+                )
+            return True
+
+        _LOGGER.warning(
+            "Gateway %s did not acknowledge any of %d activation pings (%.1f s each). "
+            "The hub silently ignores commands until it acks, so device syncs will "
+            "come back empty. Check that devID %r exactly matches the hub and that "
+            "UDP port %d is reachable in both directions",
+            self._ip, _ACTIVATION_ATTEMPTS, _ACTIVATION_TIMEOUT,
+            self._device_name, UDP_PORT,
+        )
+        self._activated = False
+        return False
 
     async def sync_devices(self) -> dict[int, SubDevice]:
         """Send CMD_CODE 54 and collect the CMD_CODE 55/56 responses.
@@ -229,17 +308,41 @@ class K2Gateway:
         the gateway is slow or the timeout is short).
         """
         self._sync_buffer = {}
-        self._sync_event = asyncio.Event()
 
         crc = "00020000"
         tz = timezone_offset_code()
-        self._send(build_app_send(self._device_name, self._next_msg_id(), 54, crc, tz, ""))
-        _LOGGER.debug("Sent CMD_CODE 54 sync request")
+        # A hub that never armed its session drops CMD_CODE 54 without a reply,
+        # so an empty buffer is indistinguishable from "no devices paired".
+        # Re-activate and re-ask rather than reporting zero devices on one miss;
+        # the buffer is keyed by sub_id, so a duplicate answer is harmless.
+        for attempt in range(1, _SYNC_ATTEMPTS + 1):
+            self._sync_event = asyncio.Event()
+            self._send(build_app_send(self._device_name, self._next_msg_id(), 54, crc, tz, ""))
+            _LOGGER.debug(
+                "Sent CMD_CODE 54 sync request (attempt %d/%d)", attempt, _SYNC_ATTEMPTS
+            )
 
-        with contextlib.suppress(TimeoutError):
-            await asyncio.wait_for(self._sync_event.wait(), timeout=_SYNC_COLLECT_SECONDS)
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(self._sync_event.wait(), timeout=_SYNC_COLLECT_SECONDS)
 
-        self._sync_event = None
+            self._sync_event = None
+            if self._sync_buffer or attempt == _SYNC_ATTEMPTS:
+                break
+            # An empty buffer after a *confirmed* activation is a real answer:
+            # the hub is armed and says it has no sub-devices paired, which is
+            # the normal state of a brand-new hub.  Retrying that just triples
+            # the time to report the truth, since nothing ever sets _sync_event
+            # and each attempt burns the full collect window.  Only retry when
+            # the activation went unacknowledged, because then the hub may
+            # never have armed and dropped the request without a trace.
+            if self._activated:
+                break
+            _LOGGER.debug(
+                "No CMD_CODE 55 records from %s and activation was never acked; "
+                "re-activating and retrying", self._ip
+            )
+            await self.activate()
+
         result = dict(self._sync_buffer)
         self._devices.update(result)
         _LOGGER.debug("Sync complete (source=POLL): %d devices", len(result))
@@ -486,6 +589,13 @@ class K2Gateway:
         action = obj.get("action")
         msg = obj.get("msg")
         cmd_code = msg.get("CMD_CODE") if isinstance(msg, dict) else None
+
+        # NODE_ACK/CMD_CODE 0 is the hub confirming it processed an IOT_KEY?.
+        # It carries no device data, but it is the signal activate() waits on.
+        if action == "NODE_ACK" and cmd_code == 0:
+            if self._activation_ack is not None and not self._activation_ack.done():
+                self._activation_ack.set_result(None)
+            return
 
         # Auto-ACK every NODE_SEND to stop K2 retransmission
         if action == "NODE_SEND":

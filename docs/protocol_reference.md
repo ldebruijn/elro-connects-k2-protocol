@@ -29,7 +29,7 @@ Several things differed from the static-analysis hypothesis:
 
 1. **Discovery response is `NODE_ACK`, not `device_id/token`.** In normal (already-paired) operation, the K2 responds to `IOT_KEY?` with `{"action":"NODE_ACK","devID":"<name>","msg":{"CMD_CODE":0}}`. The `device_id/token` response only appears during initial AP onboarding.
 
-2. **Activation step is required before commands.** A broadcast `IOT_KEY?` alone is not enough. The K2 ignores `APP_SEND` until it has received a *targeted* `IOT_KEY?` sent directly to its unicast IP with the correct `devID`. The probe now handles this automatically.
+2. **Activation step is required before commands.** A broadcast `IOT_KEY?` alone is not enough. The K2 ignores `APP_SEND` until it has received a *targeted* `IOT_KEY?` sent directly to its unicast IP with the correct `devID`. The probe now handles this automatically. Note that this is not merely an ordering requirement — you must **wait for the resulting `NODE_ACK`** before sending anything. See [The activation gate](#the-activation-gate).
 
 3. **K2 response action is `NODE_SEND`, not `APP_SEND`.** App-to-gateway messages use `APP_SEND`; gateway-to-app messages use `NODE_SEND`. The probe's `classify_message` and auto-ack now handle `NODE_SEND`.
 
@@ -44,12 +44,58 @@ Several things differed from the static-analysis hypothesis:
 ```
 1. Bind local UDP socket to port 1025
 2. Broadcast {"action":"IOT_KEY?","devID":"NULL"} → K2 replies NODE_ACK (devID, IP now known)
-3. Send {"action":"IOT_KEY?","devID":"<name>"} unicast to gateway IP → K2 replies NODE_ACK
-4. Send APP_SEND commands → K2 replies NODE_SEND (CMD_CODE + data_str1/data_str2/data_str3)
-5. For each NODE_SEND received, reply APP_ACK (CMD_CODE 11) to stop K2 retries
+3. Send {"action":"IOT_KEY?","devID":"<name>"} unicast to gateway IP
+4. WAIT for the NODE_ACK. Do not skip this — see "The activation gate" below
+5. Send APP_SEND commands → K2 replies NODE_SEND (CMD_CODE + data_str1/data_str2/data_str3)
+6. For each NODE_SEND received, reply APP_ACK (CMD_CODE 11) to stop K2 retries
 ```
 
 The probe (`tools/k2_udp_probe.py`) implements this sequence automatically. Use it as the canonical reference.
+
+### The activation gate
+
+Step 4 is load-bearing and easy to get wrong. The K2 arms its session when it **finishes
+processing** the targeted `IOT_KEY?`, not when the packet arrives, and the `NODE_ACK` is the
+only observable signal that this has happened. A client that sends `APP_SEND` immediately after
+transmitting the ping is racing the hub.
+
+Losing that race is **silent**: an un-armed hub discards `APP_SEND` with no error, no `CMD_CODE
+11` ACK, and no response of any kind. `IOT_KEY?` keeps working throughout, because the hub
+answers it unconditionally. The observable result is a session that looks healthy — the hub is
+discovered, it acks every ping — but in which `CMD_CODE 54` returns nothing, which is
+indistinguishable from a hub that genuinely has no sub-devices paired.
+
+Measured from a real hub over a 45-minute session (Home Assistant debug log, 2026-08-20):
+
+| | value |
+| --- | --- |
+| `IOT_KEY?` → `NODE_ACK` round trip | min 4 ms, **median 66 ms**, max 344 ms |
+| Frames received in the session | 57, **all** of them `NODE_ACK`; zero `NODE_SEND` |
+
+A client that sends its first command a couple of milliseconds after the ping will therefore
+lose this race on most hubs, and consistently on a slow one. Response latency varies enough
+between hubs and networks that the same code can work reliably on one system and never work on
+another — so treat "it works on my hub" as no evidence at all that the gate is respected.
+
+**The vendor app enforces the gate structurally rather than sequentially**, which is why it is
+easy to miss when reading the app: nothing in it looks like "wait for the ack". Receiving a
+`NODE_ACK` is the only thing that marks a gateway online (`UdpControlProxy.onNodeAckDeal`
+persists the flag), and the send path checks that stored flag before every command
+(`SendCommand.onSendCommand`), falling back to the Alibaba cloud when it is unset. So the app
+never sends `APP_SEND` over UDP to an un-armed hub — and because it silently uses the cloud
+instead, the app cannot exhibit this failure at all. A local-only client has no such fallback,
+so for it the race is fatal rather than invisible.
+
+The app also **retries on silence** rather than trusting a single datagram: `UdpControlProxy`'s
+resend loop sends up to three times, spaced one second apart, stopping early once anything is
+received.
+
+Two consequences for any client:
+
+- Treat the `NODE_ACK` as a required handshake step, not as optional telemetry. `CMD_CODE 0` is
+  the frame to watch for; it carries no device data, which makes it tempting to leave unrouted.
+- An empty `CMD_CODE 54` result is only trustworthy if activation was **confirmed**. Unconfirmed
+  and empty means "ask again"; confirmed and empty means "this hub really has no devices".
 
 ## Working assumption (confirmed)
 

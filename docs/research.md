@@ -116,3 +116,36 @@ Two details differ from what the send path alone suggests, and cost some time to
   initial AP setup, never in normal operation.
 - The K2 answers commands with `action:"NODE_SEND"`. `APP_SEND` is app-to-gateway only — the
   direction matters.
+
+## The activation gate, and why "it works on my hub" proved nothing
+
+The mandatory targeted `IOT_KEY?` above turned out to be understated in a way that caused a real
+bug. It is not enough to *send* the activation before the first command — you have to wait for
+the `NODE_ACK` it produces. The hub arms when it finishes processing the ping, and that ack is
+the only way to know it has.
+
+This surfaced as user reports of "the hub connects but no devices appear", which for a while
+looked like a Home Assistant OS networking problem. It wasn't; HAOS was a red herring. A debug
+log from an affected user settled it: 57 frames received over 45 minutes, **every one of them a
+`NODE_ACK`**, not a single `NODE_SEND`. The hub was answering every ping and ignoring every
+command. Timing the same log showed the hub taking a median of 66 ms (max 344 ms) to answer an
+activation ping, while the library was sending `CMD_CODE 54` a flat 2 ms later — losing the race
+24 times out of 24.
+
+Three things made this hard to see:
+
+- **The failure is silent.** An un-armed hub drops `APP_SEND` with no error and no ack, so the
+  symptom is an empty device list, which is exactly what a hub with nothing paired reports.
+- **It is a race, so it is environment-dependent.** Hubs answering in 4 ms armed in time; hubs
+  answering in 300 ms did not. The same code genuinely worked for some users and never worked
+  for others, which kept pointing suspicion at hosting and networking.
+- **The app cannot exhibit it.** The app gates on a persisted "gateway online" flag that only a
+  received `NODE_ACK` sets, and falls back to the Alibaba cloud when it is unset. The gate is
+  therefore split across two files and never looks like a wait, so reading the send path alone
+  suggests the ordering is all that matters. `tools/k2_udp_probe.py` had been reproducing the
+  gate by accident — it drains a receive loop after activating — and porting the sequence into
+  the library dropped that incidental wait.
+
+The lesson worth carrying: for this protocol, a handshake step that "works on my hardware" is
+weak evidence. Latency varies enough between hubs that a timing bug can be invisible on one
+system and total on another. The `NODE_ACK` is cheap to wait for; wait for it.
