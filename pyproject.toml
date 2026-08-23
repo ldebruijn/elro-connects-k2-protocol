@@ -8,7 +8,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "elro-connects-k2-protocol"
-version = "0.1.0"
+version = "0.1.1"
 description = "Local UDP protocol library for ELRO Connects K2 (SF50GA) gateways"
 readme = "README.md"
 requires-python = ">=3.12"
