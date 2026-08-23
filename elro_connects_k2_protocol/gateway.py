@@ -292,8 +292,11 @@ class K2Gateway:
         _LOGGER.warning(
             "Gateway %s did not acknowledge any of %d activation pings (%.1f s each). "
             "The hub silently ignores commands until it acks, so device syncs will "
-            "come back empty. Check that devID %r exactly matches the hub and that "
-            "UDP port %d is reachable in both directions",
+            "come back empty. Check that devID %r exactly matches the hub, that "
+            "UDP port %d is reachable in both directions, and that nothing is "
+            "silently dropping the hub's own outbound internet traffic — while a "
+            "blocked call home is stalling it, the hub stops answering locally "
+            "until that attempt times out on its own",
             self._ip, _ACTIVATION_ATTEMPTS, _ACTIVATION_TIMEOUT,
             self._device_name, UDP_PORT,
         )

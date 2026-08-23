@@ -97,6 +97,10 @@ Two consequences for any client:
 - An empty `CMD_CODE 54` result is only trustworthy if activation was **confirmed**. Unconfirmed
   and empty means "ask again"; confirmed and empty means "this hub really has no devices".
 
+Note that a confirmed activation is not proof the hub is healthy — a hub stalled on a blocked
+call home produces the same "acks pings, ignores commands" signature. See [The hub's call home,
+and why *how* you block it matters](research.md#the-hubs-call-home-and-why-how-you-block-it-matters).
+
 ## Working assumption (confirmed)
 
 Local-first UDP control is viable. No cloud interaction is needed after initial device setup through the official app. The K2 responds to any host on port 1025 that follows the activation sequence — no per-command authentication, no IP whitelist beyond the activation handshake.
@@ -628,3 +632,7 @@ Deliberately not guessed at — treat as opaque rather than inventing semantics:
 - **How long the K2 accepts `APP_SEND` after activation** is not precisely known. The library
   re-activates on a 60 s timer, which is comfortably inside the working window, but the actual
   expiry has not been measured.
+- **How long the hub stalls when its call home to `aliyun.com` is silently dropped** — its own
+  connect timeout — has not been measured, nor has which parts of the local path stall with it.
+  The library's activation timeout is a guess at that number, not a fit to it. See
+  [research.md](research.md#the-hubs-call-home-and-why-how-you-block-it-matters).
