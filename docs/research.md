@@ -149,3 +149,44 @@ Three things made this hard to see:
 The lesson worth carrying: for this protocol, a handshake step that "works on my hardware" is
 weak evidence. Latency varies enough between hubs that a timing bug can be invisible on one
 system and total on another. The `NODE_ACK` is cheap to wait for; wait for it.
+
+## The hub's call home, and why *how* you block it matters
+
+Local control needs no cloud, but the hub does not know that. It is an Alibaba IoT device and
+it reaches out to Alibaba Cloud (`aliyun.com`) on its own account, independently of anything a
+local client does. That call home is normally invisible — until a firewall stands in its way,
+and then the way the firewall refuses matters more than the fact that it refuses.
+
+A user's "no devices in Home Assistant" turned out to be a firewall rule blocking Chinese
+address space. Removing the rule fixed it. The mechanism follows from how the two kinds of
+block behave:
+
+- **A fast failure** — DNS blackhole, `REJECT`, ICMP unreachable, TCP RST — returns an error to
+  the hub immediately. The hub gives up on the connection and carries on serving local
+  requests.
+- **A silent drop** — the default for country-block rules — returns nothing. The hub's
+  connection attempt sits there retransmitting until its own TCP timeout expires, which is tens
+  of seconds rather than milliseconds.
+
+**The stall is temporary, not a permanent outage.** The hub is busy, not broken: once the
+connect attempt times out on its own it goes back to serving local requests normally. That is
+what makes the symptom intermittent rather than absolute — a sync that lands inside the window
+comes back empty, and the same sync a moment later succeeds. It also means the window reopens
+every time the hub retries its call home.
+
+The observable symptom during that window is a hub that still answers `IOT_KEY?` but stops
+answering `APP_SEND`: `NODE_ACK` keeps coming back while `CMD_CODE 54` produces nothing. That
+is the same signature as the activation race above, which is what makes the two failure modes
+easy to confuse — and worth checking the firewall for even when the handshake looks healthy.
+
+**The practical advice is not "give the hub internet access".** It is: if you block the hub's
+outbound traffic, block it so the failure is *fast*. A DNS-level block or a `REJECT` rule
+achieves the same isolation as a `DROP` without stalling the hub.
+
+**Still unmeasured:** how long the hub actually stalls, i.e. its own connect timeout. That
+number is what a client's activation timeout would have to exceed to ride out a blocked call
+home, and until someone captures activation latency with a `DROP` rule in place, the library's
+2 s × 3 attempts is a guess at it rather than a fit to it. A useful capture would also settle
+whether the stall touches the activation path at all: if the hub keeps acking `IOT_KEY?`
+promptly while `CMD_CODE 54` stays silent, a longer activation timeout will not help and the
+retry has to move to the sync.
