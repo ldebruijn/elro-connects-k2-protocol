@@ -39,6 +39,7 @@ import contextlib
 import dataclasses
 import logging
 import socket as _socket
+import time
 from collections.abc import Callable
 from typing import Any
 
@@ -104,8 +105,18 @@ def _carry_forward(existing: SubDevice | None, incoming: SubDevice) -> SubDevice
 
 # How long to collect CMD_CODE 55/56 packets before declaring sync complete.
 _SYNC_COLLECT_SECONDS: float = 3.0
-# How long to wait for CMD_CODE 17 NAME_OVER before giving up on name sync.
-_NAME_COLLECT_SECONDS: float = 3.0
+# Name sync is bounded by silence, not by a total budget.  The hub answers
+# CMD_CODE 24 with one CMD_CODE 17 frame per sub-device at its own pace (the
+# vendor app never ACKs those frames -- ReceiveHandler only ACKs CMD_CODE 11 --
+# so nothing we do speeds them up), terminated by NAME_OVER.  A fixed overall
+# budget therefore has to grow with the size of the device table, and silently
+# truncates the tail of the batch when it does not.  Waiting for a gap in the
+# stream instead makes the cost independent of device count.
+#
+# How long the hub may stay silent before name sync is considered finished.
+_NAME_IDLE_SECONDS: float = 2.0
+# Absolute cap on one name sync, so a hub that streams forever still returns.
+_NAME_MAX_SECONDS: float = 30.0
 # How long to wait for the hub's CMD_CODE 11 ACK confirming a command was taken.
 _ACK_TIMEOUT: float = 5.0
 # How long to wait for the NODE_ACK confirming the hub processed an activation
@@ -175,6 +186,8 @@ class K2Gateway:
         # Name sync state: set while CMD_CODE 24 is in flight
         self._name_buffer: dict[int, str] = {}
         self._name_event: asyncio.Event | None = None
+        # Monotonic timestamp of the last CMD_CODE 17 frame, for the idle timeout
+        self._name_last_frame: float = 0.0
         # Sub-device info state: one future per sub_id, set while CMD_CODE 16 is in flight
         self._pending_sub_info: dict[int, asyncio.Future[SubDevice]] = {}
         # Gateway info state: set while CMD_CODE 12 is in flight
@@ -386,23 +399,58 @@ class K2Gateway:
         The hub does NOT push name changes unsolicited — names only update
         when this method is called (i.e. on startup / integration reload).
 
+        Collection ends on the NAME_OVER sentinel, after _NAME_IDLE_SECONDS
+        without a name frame, or at the _NAME_MAX_SECONDS cap -- whichever comes
+        first.  Names already collected are always returned, so a hub that goes
+        quiet mid-batch still yields the names it did send.
+
+        Completion is deliberately not defined as "a name for every known
+        sub_id": the hub only stores names that were explicitly set, so a
+        sub-device the owner never renamed produces no frame at all and that
+        condition would never be satisfied.
+
         Returns a sub_id → nickname mapping; empty dict if the hub has no
-        custom names set or the request times out.
+        custom names set or never answered.
         """
         self._name_buffer = {}
         self._name_event = asyncio.Event()
+        self._name_last_frame = time.monotonic()
+        hard_deadline = self._name_last_frame + _NAME_MAX_SECONDS
 
         self._send(build_app_send(self._device_name, self._next_msg_id(), 24, "00020000", "", ""))
         _LOGGER.debug("Sent CMD_CODE 24 name sync request")
 
-        try:
-            await asyncio.wait_for(self._name_event.wait(), timeout=_NAME_COLLECT_SECONDS)
-        except TimeoutError:
-            _LOGGER.debug("CMD_CODE 24 name sync timed out (no NAME_OVER received)")
+        complete = False
+        while True:
+            # Re-read _name_last_frame each pass: every name frame that arrives
+            # pushes the idle deadline out, so a slow hub is waited out as long
+            # as it keeps talking.
+            timeout = (
+                min(self._name_last_frame + _NAME_IDLE_SECONDS, hard_deadline)
+                - time.monotonic()
+            )
+            if timeout <= 0:
+                break
+            try:
+                await asyncio.wait_for(self._name_event.wait(), timeout=timeout)
+            except TimeoutError:
+                continue
+            complete = True
+            break
 
         self._name_event = None
         result = dict(self._name_buffer)
-        _LOGGER.debug("Name sync complete: %d nickname(s) found", len(result))
+        if complete:
+            _LOGGER.debug("Name sync complete: %d nickname(s) found", len(result))
+        elif result:
+            # Partial results are indistinguishable from "the hub has no names
+            # set" to the caller, so say so loudly rather than at debug level.
+            _LOGGER.warning(
+                "CMD_CODE 24 name sync ended without NAME_OVER after %d nickname(s); "
+                "the device list may be missing names", len(result),
+            )
+        else:
+            _LOGGER.debug("CMD_CODE 24 name sync timed out (no CMD_CODE 17 frames received)")
         return result
 
     def send_device_action(self, sub_id: int, action: str) -> None:
@@ -842,6 +890,10 @@ class K2Gateway:
         if not isinstance(msg, dict):
             return
         data_str2: Any = msg.get("data_str2") or msg.get("rev_str2")
+        # Any frame at all means the hub is still streaming, so push the idle
+        # deadline out -- including one that fails to decode below, which is
+        # evidence of activity even though it yields no name.
+        self._name_last_frame = time.monotonic()
         if data_str2 == "NAME_OVER":
             if self._name_event is not None:
                 self._name_event.set()

@@ -39,6 +39,33 @@ Several things differed from the static-analysis hypothesis:
 
 6. **Source port 1025 is required.** Sending `APP_SEND` from an ephemeral port gets no response at all, not even `NODE_ACK`.
 
+### Name sync is a paced stream, not a request/response (CMD_CODE 24 → 17)
+
+`CMD_CODE 24` does not return a single answer. The hub replies with **one `CMD_CODE 17` frame per
+*named* sub-device**, emitted at its own pace, terminated by a frame whose `data_str2` is the
+literal `NAME_OVER`. Three consequences that are easy to get wrong:
+
+1. **The batch takes seconds, and scales with the device table.** A field report on an eight-device
+   hub ([protocol issue #1]) put the gap between frames at roughly 350–400 ms, so that hub needed
+   over 3 s to finish. A client that budgets a fixed wall-clock window for the whole batch will
+   silently truncate its tail on any hub larger than the one it was tuned against.
+
+2. **The client cannot speed the stream up.** `ReceiveHandler.run` ACKs only `CMD_CODE 11`; name
+   frames are not acknowledged, so there is no per-frame handshake driving the hub forward. The
+   vendor app applies no timeout at all — it consumes frames until `NAME_OVER`, then fires
+   sync-finished event state `2`.
+
+3. **Unnamed sub-devices produce no frame.** The hub only stores names that were explicitly set
+   (`CMD_CODE 5`, `modifyEquipmentName`), so the frame count is the number of *named* devices, not
+   the number of paired ones. This rules out the obvious completion test: "wait until every known
+   sub_id has a name" is never satisfied on a hub with any unnamed device.
+
+The safe shape for a client is to end collection on whichever comes first: `NAME_OVER`, or a gap in
+the stream longer than the hub's inter-frame pacing — plus an absolute cap. Neither grows with
+device count.
+
+[protocol issue #1]: https://github.com/ldebruijn/elro-connects-k2-protocol/issues/1
+
 ### Full connection sequence (confirmed)
 
 ```

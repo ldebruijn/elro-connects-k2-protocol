@@ -51,7 +51,7 @@ def _fast_timeouts(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     """
     monkeypatch.setattr(gateway_mod, "_ACTIVATION_TIMEOUT", 0.2)
     monkeypatch.setattr(gateway_mod, "_SYNC_COLLECT_SECONDS", 0.2)
-    monkeypatch.setattr(gateway_mod, "_NAME_COLLECT_SECONDS", 0.05)
+    monkeypatch.setattr(gateway_mod, "_NAME_IDLE_SECONDS", 0.05)
     yield
 
 
