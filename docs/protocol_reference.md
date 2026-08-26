@@ -55,10 +55,21 @@ literal `NAME_OVER`. Three consequences that are easy to get wrong:
    vendor app applies no timeout at all — it consumes frames until `NAME_OVER`, then fires
    sync-finished event state `2`.
 
-3. **Unnamed sub-devices produce no frame.** The hub only stores names that were explicitly set
-   (`CMD_CODE 5`, `modifyEquipmentName`), so the frame count is the number of *named* devices, not
-   the number of paired ones. This rules out the obvious completion test: "wait until every known
-   sub_id has a name" is never satisfied on a hub with any unnamed device.
+3. **Unnamed sub-devices produce no frame — confirmed against hardware.** The hub only stores
+   names that were explicitly set (`CMD_CODE 5`, `modifyEquipmentName`), so the frame count is the
+   number of *named* devices, not the number of paired ones. On the reference hub, four paired
+   sub-devices (1, 2, 3, 6) yield exactly three name frames: sub_id 6 was never renamed, so the hub
+   sends nothing for it and it has no nickname. This rules out the obvious completion test: "wait
+   until every known sub_id has a name" is never satisfied on a hub with any unnamed device.
+
+   It also means **a missing nickname is not by itself a client bug**. The vendor app shows a name
+   for such a device regardless, because it falls back to its own local row — so "the app shows a
+   name but the integration does not" is the expected outcome for a device whose naming step was
+   skipped at pairing time, not evidence of a decoding fault.
+
+4. **The hub retransmits name frames.** A capture of a single `CMD_CODE 24` on the reference hub
+   delivered sub_id 3's record twice. Collecting into a dict keyed by sub_id makes this harmless,
+   but a client that counts frames rather than keying them will over-count.
 
 The safe shape for a client is to end collection on whichever comes first: `NAME_OVER`, or a gap in
 the stream longer than the hub's inter-frame pacing — plus an absolute cap. Neither grows with
