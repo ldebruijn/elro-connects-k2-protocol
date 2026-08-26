@@ -34,6 +34,8 @@ elro_connects_k2_protocol/
 tests/               Fixture-driven; tests/fixtures/*.json hold real captured payloads
 tools/k2_simulator.py  Fake hub — sends real UDP packets, nothing mocked
 tools/k2_udp_probe.py  Stdlib-only wire probe for raw exploration
+tools/name_sync_report.sh  Pasteable nickname-sync report for bug reports; also
+                       validates a name against the encoder via --check-name
 ```
 
 ## Commands
