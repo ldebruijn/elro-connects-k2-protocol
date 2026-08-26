@@ -299,6 +299,11 @@ def command_payload(args: argparse.Namespace, msg_id: int) -> str | None:
         crc = args.device_crc.upper()
         tz = args.timezone_code.upper()
         return build_app_send(args.device_name, msg_id, 54, crc, tz, "")
+    if args.command == "sync-names":
+        # The hub answers with one CMD_CODE 17 frame per *named* sub-device,
+        # ending with data_str2 == "NAME_OVER".  Raise --timeout to see the
+        # whole stream: real hubs pace these ~350-400 ms apart.
+        return build_app_send(args.device_name, msg_id, 24, args.device_crc.upper(), "", "")
     if args.command == "sub-device-info":
         return build_app_send(args.device_name, msg_id, 16, two_byte_hex(args.sub_id), "", "")
     if args.command == "gateway-alarms":
@@ -405,6 +410,7 @@ def parse_args() -> argparse.Namespace:
         choices=(
             "gateway-info",
             "sync-status",
+            "sync-names",
             "sub-device-info",
             "gateway-alarms",
             "sub-device-alarms",
@@ -423,7 +429,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--device-crc",
         default="00020000",
-        help="rev_str1 for sync-status. App uses 00020000 when no sub-device cache exists.",
+        help=(
+            "rev_str1 for sync-status and sync-names. App uses 00020000 when no sub-device "
+            "cache exists. For sync-names the app instead sends a 2-byte length followed by "
+            "one 2-byte name CRC per sub_id from 1..max (CoderUtils.getDeviceNameCRC)."
+        ),
     )
     parser.add_argument(
         "--timezone-code",

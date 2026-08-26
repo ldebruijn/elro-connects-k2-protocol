@@ -182,6 +182,63 @@ async def test_a_silent_tail_returns_what_arrived(caplog: pytest.LogCaptureFixtu
     )
 
 
+# -- observability -------------------------------------------------------------
+
+async def test_an_oversized_name_record_is_reported(caplog: pytest.LogCaptureFixture) -> None:
+    """A record the decoder rejects must name itself in the log, with its hex.
+
+    The vendor encoder (CoderUtils.getAscii) only produces a 36-char record when
+    the name fits in 15 GBK bytes; its pairing-time naming screen
+    (AssignRoomsActivity) enforces no such limit, so longer records are
+    reachable in the field.  decode_device_name drops those, and without this
+    log line the resulting missing nickname is indistinguishable from a hub that
+    never sent one -- which is exactly what made issue #1 undiagnosable.
+    """
+    oversized = _name_record(1, "Kitchen smoke alarm")
+    assert len(oversized) != 36, "this fixture is supposed to be a malformed record"
+
+    gw = _make({2: "Kitchen"})
+    with caplog.at_level(logging.DEBUG, logger="elro_connects_k2_protocol.gateway"):
+        gw._on_message(
+            {
+                "action": "NODE_SEND",
+                "devID": DEVICE,
+                "msg": {"CMD_CODE": 17, "data_str1": "", "data_str2": oversized},
+            },
+            IP,
+        )
+
+    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert warnings, "an undecodable name record was dropped without a word"
+    assert any(oversized in r.getMessage() for r in warnings), (
+        "the warning must carry the raw record -- it is the whole diagnostic"
+    )
+
+
+async def test_a_device_with_no_name_does_not_warn(caplog: pytest.LogCaptureFixture) -> None:
+    """A sub-device the owner never renamed is normal, not an anomaly.
+
+    The hub returns a full-size record whose name field is all padding.  That
+    also decodes to nothing, but warning about it would fire on every sync for
+    every unnamed device, which would bury the case above.
+    """
+    gw = _make({})
+    with caplog.at_level(logging.DEBUG, logger="elro_connects_k2_protocol.gateway"):
+        gw._on_message(
+            {
+                "action": "NODE_SEND",
+                "devID": DEVICE,
+                "msg": {"CMD_CODE": 17, "data_str1": "", "data_str2": _name_record(1, "")},
+            },
+            IP,
+        )
+
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING], (
+        "an unnamed sub-device should not raise a warning"
+    )
+    assert caplog.records, "the record should still be visible at debug"
+
+
 async def test_a_hub_that_never_stops_hits_the_cap() -> None:
     """The idle window must not let an endless stream run forever."""
     gw = _make({}, _EndlessHub, send_name_over=False)

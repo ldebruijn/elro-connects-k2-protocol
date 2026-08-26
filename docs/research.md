@@ -190,3 +190,56 @@ home, and until someone captures activation latency with a `DROP` rule in place,
 whether the stall touches the activation path at all: if the hub keeps acking `IOT_KEY?`
 promptly while `CMD_CODE 54` stays silent, a longer activation timeout will not help and the
 retry has to move to the sync.
+
+## Why a nickname can go missing, and why the vendor app never notices
+
+Reported as [protocol issue #1]: with eight sub-devices, the nicknames for the first and last
+came back empty. The last one was a collect-window bug — name sync used to spend one fixed 3 s
+budget on a stream whose length grows with the device table (see
+[protocol_reference.md](protocol_reference.md) on `CMD_CODE 24 → 17`). The first one is a
+different fault, still open at the time of writing, and the interesting part is the asymmetry
+that hides it.
+
+**The vendor app cannot experience this bug.** `ReceiveHandler.uploadDeviceName` hands each
+record to `DeviceDaoUtil.updateSubDeviceName`, which writes the decoded name into the app's own
+SQLite row; every screen then reads the name from that row. The app only exercises the *decode*
+path for names set on some other phone. Whatever it typed, it already has. A name the hub
+stores but nobody can decode is invisible to app users and total to us, because a local database
+is exactly what a headless client does not have.
+
+**And the app's two naming screens do not agree on what a legal name is.** The rename dialog
+(`RenameDialogFragment`) installs `InputFilterUtil.setEditTextInhibitInputSpaChat`, which blocks
+`@` and `$` outright — they are the padding and terminator sentinels in the wire encoding —
+blocks emoji, and truncates once a running weight exceeds 15, counting 2 for any character above
+`z`. The naming step during pairing (`AssignRoomsActivity`) installs none of that: it assigns
+`mNickName = editable.toString()` straight from a `TextWatcher` and passes it to
+`CoderUtils.getAscii` unchecked.
+
+That matters because `getAscii` left-pads to 15 bytes and appends `$`, producing a 16-byte
+field — but only while the name fits. Past 15 GBK bytes the padding loop does not execute and
+the field simply grows, so the record exceeds its nominal 36 hex chars and every strict decoder
+rejects it, the vendor's `getStringFromAscii` included. Note also that byte and character limits
+are not the same limit: a cap of 15 *characters* still permits 30 GBK bytes once the name is not
+ASCII.
+
+The practical consequence is that **a nickname set while pairing a device is not guaranteed to
+survive the round trip**, while one set by renaming it later is. Since sub_id 1 is usually the
+first device someone paired, it is the most likely to carry a name from the unvalidated screen —
+which is the leading explanation for the missing sub_id 1 nickname, though not yet confirmed
+against a hub that reproduces it.
+
+**What to do about it is deliberately not settled here.** The competing explanation is that the
+hub never sends a record for that sub-device at all, and the two are indistinguishable from the
+outside — which is why `_on_device_name` now logs every record raw before decoding, and reports
+the ones it drops. Run `tools/k2_udp_probe.py --command sync-names` against a hub that
+reproduces it and read the answer off the wire: a `CMD_CODE 17` frame whose `data_str2` begins
+`0001` means the record arrives and we are rejecting it; no such frame means the hub is
+withholding it and the cause is upstream of any decoding.
+
+One thing already ruled out: the request-side CRC block. We send `CMD_CODE 24` with a hardcoded
+`00020000`, which `CoderUtils.getDeviceNameCRC` emits only for an empty device database, and
+under the app's own format that constant describes a table whose single slot is sub_id 1 —
+suggestive. But `CMD_CODE 54` carries the identical block and sub_id 1's *status* comes back
+without trouble, so the block is not what suppresses slot 1.
+
+[protocol issue #1]: https://github.com/ldebruijn/elro-connects-k2-protocol/issues/1

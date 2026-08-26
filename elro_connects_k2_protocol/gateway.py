@@ -105,6 +105,11 @@ def _carry_forward(existing: SubDevice | None, incoming: SubDevice) -> SubDevice
 
 # How long to collect CMD_CODE 55/56 packets before declaring sync complete.
 _SYNC_COLLECT_SECONDS: float = 3.0
+# Length of a well-formed CMD_CODE 17 name record: 2-byte sub_id plus a
+# 16-byte GBK name field, hex-encoded.  Kept here rather than inlined so the
+# diagnostic in _on_device_name and the parser agree on what "expected" means.
+_NAME_RECORD_LEN: int = 36
+
 # Name sync is bounded by silence, not by a total budget.  The hub answers
 # CMD_CODE 24 with one CMD_CODE 17 frame per sub-device at its own pace (the
 # vendor app never ACKs those frames -- ReceiveHandler only ACKs CMD_CODE 11 --
@@ -885,6 +890,12 @@ class K2Gateway:
 
         Arrives in response to CMD_CODE 24.  Each frame carries one name record
         in ``data_str2`` until the hub sends the sentinel ``"NAME_OVER"``.
+
+        Every record is logged raw before decoding, and a record that does not
+        decode is reported rather than dropped in silence.  Without that, a
+        nickname that never turns up is indistinguishable from one the hub
+        never sent -- and only one of those is a bug on this side.  See
+        docs/research.md on the missing sub_id=1 nickname.
         """
         msg: Any = obj.get("msg", obj)
         if not isinstance(msg, dict):
@@ -895,13 +906,40 @@ class K2Gateway:
         # evidence of activity even though it yields no name.
         self._name_last_frame = time.monotonic()
         if data_str2 == "NAME_OVER":
+            _LOGGER.debug("Name record: NAME_OVER sentinel")
             if self._name_event is not None:
                 self._name_event.set()
             return
         if not isinstance(data_str2, str):
+            _LOGGER.warning("CMD_CODE 17 frame carried no name record: %r", data_str2)
             return
+        # Raw first: a record we cannot decode is still evidence, and the hex is
+        # what makes it diagnosable off a user's log.
+        _LOGGER.debug(
+            "Name record: sub_id_field=%s len=%d raw=%s",
+            data_str2[:4] or "(empty)", len(data_str2), data_str2,
+        )
         result = decode_device_name(data_str2)
-        if result is not None:
+        if result is None:
+            # A record of the expected size that yields nothing is usually a
+            # sub-device the owner never renamed -- the hub stores no name and
+            # the field is all padding.  That is normal, so it stays at debug
+            # rather than warning on every sync.  A record of any other size is
+            # a real anomaly: the vendor encoder only produces 36 when the name
+            # fits in 15 GBK bytes, and its pairing-time naming screen enforces
+            # no such limit.
+            if len(data_str2) == _NAME_RECORD_LEN:
+                _LOGGER.debug(
+                    "Name record yielded no nickname (no name set, or unparseable): %s",
+                    data_str2,
+                )
+            else:
+                _LOGGER.warning(
+                    "CMD_CODE 17 name record is %d chars, expected %d: %s -- "
+                    "sub-device %s will have no nickname",
+                    len(data_str2), _NAME_RECORD_LEN, data_str2, data_str2[:4] or "(empty)",
+                )
+        else:
             sub_id, name = result
             self._name_buffer[sub_id] = name
             _LOGGER.debug("Name received: sub_id=%d nickname=%r", sub_id, name)
