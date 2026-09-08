@@ -80,7 +80,8 @@ device count.
 ### Full connection sequence (confirmed)
 
 ```
-1. Bind local UDP socket to port 1025
+1. Bind the local UDP socket to port 1025 (one per process, shared by every gateway —
+   see "Several gateways share one socket" below)
 2. Broadcast {"action":"IOT_KEY?","devID":"NULL"} → K2 replies NODE_ACK (devID, IP now known)
 3. Send {"action":"IOT_KEY?","devID":"<name>"} unicast to gateway IP
 4. WAIT for the NODE_ACK. Do not skip this — see "The activation gate" below
@@ -89,6 +90,40 @@ device count.
 ```
 
 The probe (`tools/k2_udp_probe.py`) implements this sequence automatically. Use it as the canonical reference.
+
+### Several gateways share one socket, demultiplexed by `devID`
+
+K2 hubs do not mesh. A house with an outbuilding runs one hub per building, each with its own
+independent set of sub-devices — and each numbering those sub-devices from 1, so sub-device ids
+are only meaningful relative to a hub.
+
+Port 1025 is not negotiable on either end: the hub always sends to port 1025 on the controlling
+host, and it ignores `APP_SEND` arriving from an ephemeral source port (see "Source port 1025 is
+required" above). So a host talking to *N* hubs cannot give each hub its own socket — there is
+only one port to bind, and binding it twice does not divide the traffic. With `SO_REUSEADDR` the
+second bind succeeds, but an inbound unicast datagram is delivered to only one of the sockets
+bound to the address, so one hub ends up working and the other silently deaf.
+
+The vendor app never binds twice. `domain/udp/UdpSocket.java` is a singleton holding one socket
+on 1025 for every gateway the user owns, and `domain/udp/UdpControlProxy.receiveData`
+demultiplexes each frame on the `devID` it carries, reading `devID` unconditionally before it
+dispatches on anything else. Every frame the hub sends carries it.
+
+The datagram's source address is used for exactly one thing: recording where a hub currently
+lives. `UdpControlProxy.onNodeAckDeal` rewrites the stored `IntranetBean` address from the
+source of every `NODE_ACK`, which is how the app follows a hub that DHCP has moved. It is
+**not** used to decide which gateway a frame belongs to — `devID` is.
+
+```
+1. Bind ONE socket to 0.0.0.0:1025 for the whole process
+2. Keep a devID → gateway table; register each hub as it connects
+3. On receive: route by frame["devID"]; drop frames naming a devID you do not own
+4. On send: sendto((that hub's IP, 1025)) from the same shared socket
+```
+
+Routing on anything looser than an exact `devID` match reintroduces the failure it exists to
+prevent: hub A's `CMD_CODE 55` sync response parsed into hub B's device table, where the two
+hubs' sub-device ids overwrite each other.
 
 ### The activation gate
 

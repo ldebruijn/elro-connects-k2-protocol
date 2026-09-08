@@ -1,9 +1,10 @@
 """Async K2 gateway client.
 
-Maintains a persistent UDP socket on port 1025 for the lifetime of the
-connection.  Incoming messages are routed by (action, CMD_CODE, payload
-shape) — never by device type — matching how the official Android app's
-``ReceiveHandler`` works.
+Shares one process-wide UDP socket on port 1025 with every other gateway
+(see ``transport.py``, which explains why it has to be shared).  Frames
+addressed to this gateway's ``devID`` arrive at ``_on_message``, where they are
+routed by (action, CMD_CODE, payload shape) — never by device type — matching
+how the official Android app's ``ReceiveHandler`` works.
 
 ## CMD_CODE 19 push routing
 
@@ -38,7 +39,6 @@ import asyncio
 import contextlib
 import dataclasses
 import logging
-import socket as _socket
 import time
 from collections.abc import Callable
 from typing import Any
@@ -65,9 +65,13 @@ from elro_connects_k2_protocol.protocol import (
     build_activation,
     build_app_send,
     build_discovery,
-    decrypt_message,
     encrypt_message,
     timezone_offset_code,
+)
+from elro_connects_k2_protocol.transport import (
+    K2Transport,
+    open_sniffer,
+    open_transport,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -154,34 +158,13 @@ def _decode_acked_code(data_str1: str) -> int | None:
         return None
 
 
-class _K2Protocol(asyncio.DatagramProtocol):
-    def __init__(self, gateway: K2Gateway) -> None:
-        self._gateway = gateway
-        self.transport: asyncio.DatagramTransport | None = None
-
-    def connection_made(self, transport: asyncio.BaseTransport) -> None:
-        self.transport = transport  # type: ignore[assignment]
-
-    def datagram_received(self, data: bytes, addr: tuple[str, int]) -> None:
-        _text, obj = decrypt_message(data)
-        if obj is not None:
-            self._gateway._on_message(obj, addr[0])
-
-    def error_received(self, exc: Exception) -> None:
-        _LOGGER.warning("UDP error: %s", exc)
-
-    def connection_lost(self, exc: Exception | None) -> None:
-        _LOGGER.warning("UDP connection lost: %s", exc)
-
-
 class K2Gateway:
     """Async client for the ELRO Connects K2 local UDP protocol."""
 
     def __init__(self, ip: str, device_name: str) -> None:
         self._ip = ip
         self._device_name = device_name
-        self._transport: asyncio.DatagramTransport | None = None
-        self._protocol: _K2Protocol | None = None
+        self._transport: K2Transport | None = None
         self._devices: dict[int, SubDevice] = {}
         self._callbacks: list[UpdateCallback] = []
         self._msg_id: int = 0
@@ -210,36 +193,32 @@ class K2Gateway:
     # ── lifecycle ─────────────────────────────────────────────────────────────
 
     async def connect(self) -> None:
-        """Bind the persistent UDP socket and send the activation ping.
+        """Attach to the shared UDP socket and send the activation ping.
 
-        SO_REUSEADDR is set so that a reload (unload + immediate setup) can
-        bind to the same port before the OS fully releases the previous socket.
-        Without it, reloading the integration raises EADDRINUSE because
-        asyncio's transport.close() is non-blocking and the OS may still
-        consider the port in use until the next event-loop iteration processes
-        the close.
+        The socket lives in ``transport.py`` and is shared with every other
+        gateway in the process; this only registers ``_on_message`` against this
+        hub's devID and takes a reference, so port 1025 is bound exactly once no
+        matter how many hubs are configured.
         """
-        loop = asyncio.get_running_loop()
-        sock = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
-        sock.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
-        sock.setsockopt(_socket.SOL_SOCKET, _socket.SO_BROADCAST, 1)
-        sock.setblocking(False)
-        sock.bind(("0.0.0.0", UDP_PORT))
-        # allow_broadcast cannot be passed alongside sock= in Python 3.14+;
-        # SO_BROADCAST is set on the socket directly above instead.
-        self._transport, protocol = await loop.create_datagram_endpoint(
-            lambda: _K2Protocol(self),
-            sock=sock,
+        if self._transport is not None:
+            _LOGGER.debug("Gateway %s is already connected", self._device_name)
+            return
+        self._transport = await open_transport(self._device_name, self._on_message)
+        _LOGGER.debug(
+            "Gateway %s (%s) attached to the shared UDP socket on port %d",
+            self._device_name, self._ip, UDP_PORT,
         )
-        self._protocol = protocol
-        _LOGGER.debug("UDP socket bound to port %d", UDP_PORT)
         await self.activate()
 
     async def disconnect(self) -> None:
         if self._transport is not None:
             self._transport.close()
             self._transport = None
-        _LOGGER.debug("Disconnected from K2 gateway")
+        # A reconnect has to re-arm: the hub drops APP_SEND until it has acked a
+        # fresh IOT_KEY?, so carrying the old flag across a reload would let the
+        # first command afterwards be discarded silently.
+        self._activated = False
+        _LOGGER.debug("Disconnected from K2 gateway %s", self._device_name)
 
     # ── commands ──────────────────────────────────────────────────────────────
 
@@ -639,12 +618,38 @@ class K2Gateway:
     def device_name(self) -> str:
         return self._device_name
 
+    @property
+    def activated(self) -> bool:
+        """Whether the hub has acked an activation ping on this session.
+
+        The only positive proof that this hub exists at this address under this
+        devID: the hub answers a targeted IOT_KEY? with a NODE_ACK naming
+        itself, and a frame naming a devID nothing is registered for is
+        dropped.  So a caller that connects and finds this False has learned
+        that the address or the name is wrong -- which is what makes it usable
+        for validating hand-entered gateway details.
+        """
+        return self._activated
+
     # ── internal message routing ──────────────────────────────────────────────
 
     def _on_message(self, obj: dict[str, Any], source_ip: str) -> None:
         action = obj.get("action")
         msg = obj.get("msg")
         cmd_code = msg.get("CMD_CODE") if isinstance(msg, dict) else None
+
+        # Follow the hub if DHCP moved it.  The frame is only trusted to say
+        # where *this* hub lives when it names this hub, because the shared
+        # socket's no-devID fallback can deliver an unlabelled frame here.
+        # This is what the vendor app does too: UdpControlProxy.onNodeAckDeal
+        # rewrites the stored IntranetBean address from the datagram's source
+        # on every ACK.
+        if obj.get("devID") == self._device_name and source_ip != self._ip:
+            _LOGGER.info(
+                "Gateway %s answered from %s, not %s; following it to the new address",
+                self._device_name, source_ip, self._ip,
+            )
+            self._ip = source_ip
 
         # NODE_ACK/CMD_CODE 0 is the hub confirming it processed an IOT_KEY?.
         # It carries no device data, but it is the signal activate() waits on.
@@ -982,87 +987,101 @@ class K2Gateway:
 
 # ── discovery ─────────────────────────────────────────────────────────────────
 
-class _DiscoveryProtocol(asyncio.DatagramProtocol):
-    def __init__(self, result: asyncio.Future[tuple[str, str]]) -> None:
-        self._result = result
-        self.transport: asyncio.DatagramTransport | None = None
+def _responder(obj: dict[str, Any]) -> str | None:
+    """Return the devID of a hub answering a discovery broadcast, if this is one.
 
-    def connection_made(self, transport: asyncio.BaseTransport) -> None:
-        self.transport = transport  # type: ignore[assignment]
+    A hub answers ``IOT_KEY?`` with a ``NODE_ACK``/CMD_CODE 0 naming itself.
+    ``devID`` of ``"NULL"`` is the broadcast we sent, echoed back to us because
+    the shared socket also receives what it broadcasts.
+    """
+    msg = obj.get("msg")
+    cmd_code = msg.get("CMD_CODE") if isinstance(msg, dict) else None
+    dev_id = obj.get("devID")
+    if obj.get("action") != "NODE_ACK" or cmd_code != 0:
+        return None
+    if not isinstance(dev_id, str) or dev_id == "NULL":
+        return None
+    return dev_id
 
-    def datagram_received(self, data: bytes, addr: tuple[str, int]) -> None:
-        _text, obj = decrypt_message(data)
-        if obj is None:
+
+async def _discover(
+    broadcast: str,
+    timeout: float,
+    *,
+    first_only: bool,
+) -> dict[str, str]:
+    """Broadcast IOT_KEY? and collect {devID: ip} from everyone who answers.
+
+    Runs over the shared socket as a sniffer rather than opening one of its
+    own, which is what lets discovery run while gateways are already connected.
+    The previous implementation bound a second socket to port 1025 for the
+    duration, and since an inbound unicast reply reaches only one socket bound
+    there, running the two concurrently made one of them deaf.
+    """
+    loop = asyncio.get_running_loop()
+    found: dict[str, str] = {}
+    done: asyncio.Future[None] = loop.create_future()
+
+    def _sniff(obj: dict[str, Any], source_ip: str) -> None:
+        dev_id = _responder(obj)
+        if dev_id is None or dev_id in found:
             return
-        action = obj.get("action")
-        dev_id = obj.get("devID")
-        msg = obj.get("msg")
-        cmd_code = msg.get("CMD_CODE") if isinstance(msg, dict) else None
-        if (
-            action == "NODE_ACK"
-            and isinstance(dev_id, str)
-            and dev_id != "NULL"
-            and cmd_code == 0
-            and not self._result.done()
-        ):
-            self._result.set_result((addr[0], dev_id))
+        found[dev_id] = source_ip
+        _LOGGER.debug("Discovery: %s answered from %s", dev_id, source_ip)
+        if first_only and not done.done():
+            done.set_result(None)
 
-    def error_received(self, exc: Exception) -> None:
-        _LOGGER.debug("Discovery UDP error: %s", exc)
+    handle = await open_sniffer(_sniff)
+    try:
+        handle.sendto(encrypt_message(build_discovery()), (broadcast, UDP_PORT))
+        _LOGGER.debug("Sent discovery broadcast to %s", broadcast)
+        # first_only leaves `done` unresolved when nothing answers, and
+        # collect-everything never resolves it at all, so in both cases the
+        # timeout is the normal exit rather than an error.
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(done, timeout)
+    finally:
+        handle.close()
 
-    def connection_lost(self, exc: Exception | None) -> None:
-        pass
+    return found
+
+
+async def discover_gateways(
+    broadcast: str = "255.255.255.255",
+    timeout: float = 5.0,
+) -> list[K2Gateway]:
+    """Return a gateway for every K2 that answers within ``timeout``.
+
+    Always waits the full timeout, since there is no way to know a hub is the
+    last one to answer.  The returned gateways are not connected — call
+    ``connect()`` on each.
+    """
+    found = await _discover(broadcast, timeout, first_only=False)
+    if found:
+        _LOGGER.info(
+            "Discovered %d K2 gateway(s): %s",
+            len(found),
+            ", ".join(f"{dev}@{ip}" for dev, ip in sorted(found.items())),
+        )
+    else:
+        _LOGGER.debug("Discovery found no K2 gateways in %.1f s", timeout)
+    return [K2Gateway(ip, dev) for dev, ip in sorted(found.items())]
 
 
 async def discover_gateway(
     broadcast: str = "255.255.255.255",
     timeout: float = 5.0,
 ) -> K2Gateway | None:
-    """Broadcast IOT_KEY? and return a K2Gateway for the first responder.
+    """Return a K2Gateway for the first hub to answer, or None.
 
-    The returned gateway is not yet connected — call gateway.connect() before
-    sending commands.
+    Returns as soon as one hub answers, so it stays fast on the single-hub
+    setups that are the common case.  Use ``discover_gateways`` when the caller
+    needs to know about all of them.
     """
-    loop = asyncio.get_running_loop()
-    result: asyncio.Future[tuple[str, str]] = loop.create_future()
-
-    # Built by hand rather than with local_addr= so SO_REUSEADDR can be set, as
-    # K2Gateway.connect() already does.  asyncio has not set it on UDP sockets
-    # since Python 3.8 (bpo-37228), so local_addr= raised EADDRINUSE even when
-    # the only other holder of port 1025 was one of our own sockets — a
-    # connected K2Gateway, or the not-yet-reaped socket of a previous one.
-    # Discovery run from a config flow while an entry is already set up hit
-    # exactly that.
-    #
-    # Linux shares an addr:port across UDP sockets only when *every* socket
-    # bound to it sets SO_REUSEADDR, so this deliberately does not paper over
-    # an unrelated process squatting on 1025: that still raises EADDRINUSE,
-    # which is the correct answer.  Note also that while two sockets do share
-    # the port, an inbound unicast reply is delivered to just one of them, so
-    # discovery and an active session should not be run concurrently.
-    #
-    # SO_BROADCAST replaces allow_broadcast=, which cannot be passed alongside
-    # sock= in Python 3.14+.
-    sock = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
-    sock.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
-    sock.setsockopt(_socket.SOL_SOCKET, _socket.SO_BROADCAST, 1)
-    sock.setblocking(False)
-    sock.bind(("0.0.0.0", UDP_PORT))
-
-    transport, _protocol = await loop.create_datagram_endpoint(
-        lambda: _DiscoveryProtocol(result),
-        sock=sock,
-    )
-
-    try:
-        payload = encrypt_message(build_discovery())
-        transport.sendto(payload, (broadcast, UDP_PORT))
-        _LOGGER.debug("Sent discovery broadcast to %s", broadcast)
-        ip, device_name = await asyncio.wait_for(result, timeout=timeout)
-        _LOGGER.info("Discovered K2 at %s devID=%s", ip, device_name)
-        return K2Gateway(ip, device_name)
-    except TimeoutError:
+    found = await _discover(broadcast, timeout, first_only=True)
+    if not found:
         _LOGGER.debug("Discovery timed out after %.1f s", timeout)
         return None
-    finally:
-        transport.close()
+    dev_id, ip = next(iter(found.items()))
+    _LOGGER.info("Discovered K2 at %s devID=%s", ip, dev_id)
+    return K2Gateway(ip, dev_id)

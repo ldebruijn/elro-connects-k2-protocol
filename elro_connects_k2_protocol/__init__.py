@@ -10,6 +10,7 @@ from elro_connects_k2_protocol.gateway import (
     PAIRING_TIMEOUT_SECONDS,
     K2Gateway,
     discover_gateway,
+    discover_gateways,
 )
 from elro_connects_k2_protocol.models import (
     AlarmState,
@@ -50,6 +51,7 @@ __all__ = [
     "decode_device_status",
     "decode_thermostat_status",
     "discover_gateway",
+    "discover_gateways",
     "get_profile",
     "normalize_type",
     "parse_add_sub_device",

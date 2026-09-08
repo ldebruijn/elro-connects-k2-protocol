@@ -29,6 +29,20 @@ The elro-connects-k2-ha repo's compose file maps host port 1025 → container
 port 1025, so the simulator runs on the host and HA runs in the container — no
 changes needed here.  See that repo's README.
 
+### Two hubs at once
+A house with an outbuilding runs one K2 per building; the hubs are independent
+installations that do not mesh.  Two simulator instances reproduce that, and no
+extra flags are needed — both send from their own ephemeral port to
+127.0.0.1:1025, and the library demultiplexes on devID:
+
+  python tools/k2_simulator.py --device-name DEMO_HOUSE &
+  python tools/k2_simulator.py --device-name DEMO_GARAGE &
+
+Then add both to Home Assistant with host 127.0.0.1 and those two names.  Both
+instances simulate the same six sub-ids, which is deliberate: sub 1 on one hub
+and sub 1 on the other are different detectors, and a client that routes frames
+by anything other than devID will let them overwrite each other.
+
 ## Simulated devices
 
   Sub 1  Photoelectric Smoke Alarm  (type 013 / GS559A)

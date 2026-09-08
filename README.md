@@ -173,14 +173,16 @@ elro_connects_k2_protocol/
   device_profiles.py DEVICE_PROFILES registry — type code → DeviceProfile (capabilities list)
   parser.py          Pure parse functions (testable without a gateway connection)
   protocol.py        XOR framing, encrypt/decrypt, message builders
+  transport.py       The shared UDP socket on port 1025 and its devID routing table
 ```
 
-**`K2Gateway`** owns the UDP socket for the lifetime of a session. Its core methods:
+**`K2Gateway`** holds a reference to the shared UDP socket for the lifetime of a session.
+Its core methods:
 
 | Method | Protocol | Description |
 |---|---|---|
-| `connect()` | IOT_KEY? | Bind port 1025, activate session |
-| `disconnect()` | — | Close socket |
+| `connect()` | IOT_KEY? | Attach to the shared port-1025 socket, activate session |
+| `disconnect()` | — | Detach; the socket closes once the last gateway leaves |
 | `activate()` | IOT_KEY? | Re-activate / keepalive (call every ~60 s) |
 | `sync_devices()` | CMD_CODE 54 → 55/56, then 24 → 17 | Fetch all detector states and custom names |
 | `sync_device_names()` | CMD_CODE 24 → 17 | Fetch sub-device nicknames from the hub |
@@ -192,6 +194,27 @@ elro_connects_k2_protocol/
 
 Push events (CMD_CODE 19) arrive asynchronously and fire callbacks with `UpdateSource.PUSH`
 immediately when the K2 sends them — no polling required.
+
+### Several hubs
+
+K2 hubs do not mesh — a house with an outbuilding runs one hub per building, each with its
+own detectors, each numbering them from 1. Create one `K2Gateway` per hub and connect them
+all; they share a single socket on port 1025 and frames are routed to the right gateway by
+the `devID` each one carries, exactly as the vendor app does it.
+
+This has to be shared rather than one socket each: the hub only ever sends to port 1025 and
+ignores commands from an ephemeral source port, so there is one port to bind and binding it
+twice does not divide the traffic — one gateway would receive everything and the other
+nothing. See `docs/protocol_reference.md` → *Several gateways share one socket*.
+
+```python
+gateways = await discover_gateways()          # every hub that answers the broadcast
+for gw in gateways:
+    gw.add_update_callback(on_update)
+    await gw.connect()
+```
+
+`discover_gateway()` (singular) is still there and returns the first responder.
 
 **`SubDevice`** fields:
 

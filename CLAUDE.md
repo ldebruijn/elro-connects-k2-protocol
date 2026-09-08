@@ -25,7 +25,8 @@ re-deriving from the vendor app:
 
 ```
 elro_connects_k2_protocol/
-  gateway.py         K2Gateway — async client, persistent UDP listener on port 1025
+  gateway.py         K2Gateway — async client, one instance per hub
+  transport.py       The one shared UDP socket on port 1025, routing frames by devID
   models.py          SubDevice, GatewayInfo, AlarmState, UpdateSource, DeviceCapability, DeviceProfile
   device_profiles.py DEVICE_PROFILES registry — type code → DeviceProfile (capabilities list)
   parser.py          Pure parse functions (testable without a connection)
