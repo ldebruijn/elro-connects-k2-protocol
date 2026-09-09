@@ -679,6 +679,15 @@ class K2Gateway:
             self._on_ack(obj)
         elif cmd_code == 62:
             self._on_add_sub_device(obj)
+        else:
+            # A frame that reached this gateway — so it named this devID — and
+            # matched no handler.  Silence here reads exactly like silence on
+            # the wire, and the two call for opposite investigations: an
+            # unhandled CMD_CODE means the hub is talking and we are not
+            # listening, while nothing at all means the hub is not talking.
+            _LOGGER.debug(
+                "Unhandled frame from %s: action=%s CMD_CODE=%s", source_ip, action, cmd_code
+            )
 
     def _on_push_update(self, obj: dict[str, Any]) -> None:
         """Route a CMD_CODE 19 push to the correct handler based on payload shape.
@@ -851,11 +860,17 @@ class K2Gateway:
         acked_code = _decode_acked_code(data_str1)
         if acked_code is None:
             return
+        accepted = isinstance(data_str2, str) and data_str2.upper() == "OK"
+        # Logged before the waiter is consulted, and for every ACK rather than
+        # only the awaited ones.  Most commands here are fire-and-forget, so an
+        # ACK nobody waits on used to leave no trace -- and for CMD_CODE 54
+        # that trace is the whole diagnosis: an ACKed sync that returns no
+        # records means the hub processed the request and its device table is
+        # genuinely empty, while an un-ACKed one means it never listened.
+        _LOGGER.debug("ACK for CMD_CODE %d: %s", acked_code, "OK" if accepted else data_str2)
         future = self._pending_acks.get(acked_code)
         if future is None or future.done():
             return
-        accepted = isinstance(data_str2, str) and data_str2.upper() == "OK"
-        _LOGGER.debug("ACK for CMD_CODE %d: %s", acked_code, "OK" if accepted else data_str2)
         future.set_result(accepted)
 
     def _on_add_sub_device(self, obj: dict[str, Any]) -> None:

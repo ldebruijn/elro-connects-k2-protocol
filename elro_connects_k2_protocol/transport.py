@@ -154,9 +154,20 @@ class _SharedSocket(asyncio.DatagramProtocol):
         self._transport = transport  # type: ignore[assignment]
 
     def datagram_received(self, data: bytes, addr: tuple[str, int]) -> None:
-        _text, obj = decrypt_message(data)
-        if obj is not None:
-            self.dispatch(obj, addr[0])
+        text, obj = decrypt_message(data)
+        if obj is None:
+            # Dropping these without a word made "the hub answered with
+            # something we could not read" indistinguishable from "the hub
+            # never answered", which is precisely the question a hub that acks
+            # every ping while returning no devices raises.  Logged with the
+            # decoded text so a framing or truncation problem is readable
+            # straight from the log.
+            _LOGGER.debug(
+                "Undecodable %d-byte datagram from %s: %r",
+                len(data), addr[0], text[:200],
+            )
+            return
+        self.dispatch(obj, addr[0])
 
     def error_received(self, exc: Exception) -> None:
         _LOGGER.warning("UDP error: %s", exc)
