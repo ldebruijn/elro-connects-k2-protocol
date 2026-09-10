@@ -1,0 +1,23 @@
+{
+  "description": "CMD_CODE 13 gateway-info response captured from live hardware 2026-09-10 (hub ST_2310401744, four sub-devices). data_str1 is the Wi-Fi SSID in plain text -- not hex, unlike nearly every other payload in this protocol. data_str2 packs the gateway room id in [0:2] and the sub-device push flag in [2:], where '00' means enabled. Field meanings traced to DeviceInfoActivity (wifiName) and GatewayDetailActivity (isEdgeGateway) in the vendor app. SSID replaced with a placeholder; the real one is a home network name.",
+  "parser": "parse_gateway_info",
+  "input": {
+    "action": "NODE_SEND",
+    "devID": "ST_1234567890",
+    "msg": {
+      "msg_ID": 62,
+      "CMD_CODE": 13,
+      "data_str1": "HomeNetwork",
+      "data_str2": "0000",
+      "data_str3": ""
+    }
+  },
+  "expected": {
+    "device_name": "ST_1234567890",
+    "raw_data_str1": "HomeNetwork",
+    "raw_data_str2": "0000",
+    "ssid": "HomeNetwork",
+    "room_id": "00",
+    "sub_device_push": true
+  }
+}

@@ -29,6 +29,7 @@ from elro_connects_k2_protocol.parser import (
 _PARSERS = {
     "parse_sync_response": parse_sync_response,
     "parse_push_update": parse_push_update,
+    "parse_gateway_info": parse_gateway_info,
 }
 
 
@@ -60,6 +61,16 @@ def test_fixture(filename: str, fixture: dict) -> None:  # type: ignore[type-arg
         else:
             assert result is not None
             assert_device_matches(result, expected)
+
+    elif parser_name == "parse_gateway_info":
+        assert result is not None
+        for field, want in expected.items():
+            assert getattr(result, field) == want, (
+                f"{filename}: {field} was {getattr(result, field)!r}, expected {want!r}"
+            )
+
+    else:
+        raise AssertionError(f"{filename}: no assertions defined for parser {parser_name!r}")
 
 
 # ── edge cases: parse_sync_response ──────────────────────────────────────────
@@ -261,8 +272,47 @@ def test_parse_sub_device_info_response_preserves_existing_measurements() -> Non
     assert result.co2_ppm == 1200
 
 
-def test_parse_sub_device_info_response_wrong_data_str2_length() -> None:
-    obj = {"msg": {"CMD_CODE": 66, "data_str1": "00010018", "data_str2": "0457AA"}}
+def test_parse_sub_device_info_response_short_form_is_a_plain_status() -> None:
+    """Any length other than 30 is a deviceStatus, not a parse failure.
+
+    This is the regression that made every CMD_CODE 16 query cost the full
+    timeout: only the 30-char CO2/TH payload was understood, so the short form
+    every other device answers with returned None, the pending future was never
+    resolved, and the caller waited the timeout out despite the hub having
+    replied in about 12 ms.  ReceiveHandler.uploadSubDeviceInfo branches on
+    exactly this length and stores anything else verbatim.
+    """
+    obj = {"msg": {"CMD_CODE": 66, "data_str1": "0001001300", "data_str2": "0457AA7B"}}
+    result = parse_sub_device_info_response(obj)
+    assert result is not None
+    assert result.sub_id == 1
+    assert result.signal_bars == 4
+    assert result.battery_pct == 87
+    assert result.raw_status == "0457AA7B"
+    # No measurements are claimed from a payload that carries none.
+    assert result.co2_ppm is None
+    assert result.temperature_c is None
+    assert result.humidity_pct is None
+
+
+def test_parse_sub_device_info_response_short_form_all_ff() -> None:
+    """An empty CO2/TH slot answers FFFFFFFF; decode it, do not invent meaning.
+
+    The reference hub lists a sub-device whose sync record and CMD_CODE 66
+    answer are both all-FF.  Status bit meanings are only partly decoded, so
+    this is passed through the normal decoder rather than being special-cased
+    into "absent" on the strength of one hub.
+    """
+    obj = {"msg": {"CMD_CODE": 66, "data_str1": "0006201800", "data_str2": "FFFFFFFF"}}
+    result = parse_sub_device_info_response(obj)
+    assert result is not None
+    assert result.sub_id == 6
+    assert result.raw_status == "FFFFFFFF"
+
+
+def test_parse_sub_device_info_response_too_short_for_a_status() -> None:
+    """Below six chars there is not even a status to decode."""
+    obj = {"msg": {"CMD_CODE": 66, "data_str1": "00010018", "data_str2": "0457"}}
     assert parse_sub_device_info_response(obj) is None
 
 
@@ -296,6 +346,51 @@ def test_parse_gateway_info_normal() -> None:
     assert info.raw_data_str1 == "payload1"
     assert info.raw_data_str2 == "payload2"
     assert info.ip == ""  # caller fills this in from the packet source address
+
+
+def test_parse_gateway_info_decodes_ssid_and_flags() -> None:
+    """data_str1 is the SSID in plain text; data_str2 packs room + push flag."""
+    info = parse_gateway_info({
+        "devID": "K2_AB1234",
+        "msg": {"CMD_CODE": 13, "data_str1": "MyNetwork", "data_str2": "0500"},
+    })
+    assert info is not None
+    assert info.ssid == "MyNetwork"
+    assert info.room_id == "05"
+    assert info.sub_device_push is True
+
+
+def test_parse_gateway_info_push_flag_off() -> None:
+    info = parse_gateway_info({
+        "devID": "K2_AB1234",
+        "msg": {"CMD_CODE": 13, "data_str1": "Net", "data_str2": "0501"},
+    })
+    assert info is not None
+    assert info.sub_device_push is False
+
+
+def test_parse_gateway_info_short_data_str2_leaves_fields_unset() -> None:
+    """A field we cannot read must not cost us the ones we can.
+
+    The decoding is derived from two hubs; a third that answers with a shorter
+    data_str2 should still yield its SSID rather than failing the whole parse.
+    """
+    info = parse_gateway_info({
+        "devID": "K2_AB1234",
+        "msg": {"CMD_CODE": 13, "data_str1": "MyNetwork", "data_str2": "05"},
+    })
+    assert info is not None
+    assert info.ssid == "MyNetwork"
+    assert info.room_id == "05"
+    assert info.sub_device_push is None
+
+
+def test_parse_gateway_info_empty_payload_leaves_fields_none() -> None:
+    info = parse_gateway_info({"devID": "K2_X", "msg": {"CMD_CODE": 13}})
+    assert info is not None
+    assert info.ssid is None
+    assert info.room_id is None
+    assert info.sub_device_push is None
 
 
 def test_parse_gateway_info_missing_dev_id() -> None:

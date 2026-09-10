@@ -259,3 +259,106 @@ async def test_a_hub_with_no_names_returns_empty() -> None:
     names = await gw.sync_device_names()
 
     assert names == {}
+
+
+# -- the retry -----------------------------------------------------------------
+
+class _FlakyHub(_NamingHub):
+    """Answers the first CMD_CODE 24 badly and the second one properly.
+
+    Models what healthy hardware actually does: 2 of 18 measured name syncs on
+    the reference hub ended without NAME_OVER, one of them delivering nothing at
+    all.  The visible symptom is a detector with no name in Home Assistant and
+    nothing to suggest a reload would fix it.
+    """
+
+    def __init__(self, *args: Any, **kw: Any) -> None:
+        super().__init__(*args, **kw)
+        self.requests = 0
+
+    async def _stream(self) -> None:
+        self.requests += 1
+        if self.requests == 1:
+            return  # silence: the request or its answer was lost
+        for sub_id, name in self._names.items():
+            await asyncio.sleep(self._interval)
+            self._push(_name_record(sub_id, name))
+        await asyncio.sleep(self._interval)
+        self._push("NAME_OVER")
+
+
+class _HalfThenRestHub(_NamingHub):
+    """Truncates the first batch, sends the remainder on the re-ask."""
+
+    def __init__(self, *args: Any, **kw: Any) -> None:
+        super().__init__(*args, **kw)
+        self.requests = 0
+
+    async def _stream(self) -> None:
+        self.requests += 1
+        items = list(self._names.items())
+        half = len(items) // 2
+        chunk = items[:half] if self.requests == 1 else items[half:]
+        for sub_id, name in chunk:
+            await asyncio.sleep(self._interval)
+            self._push(_name_record(sub_id, name))
+        if self.requests > 1:
+            await asyncio.sleep(self._interval)
+            self._push("NAME_OVER")
+
+
+async def test_a_lost_name_batch_is_re_asked() -> None:
+    """One silent answer must not cost the user every nickname."""
+    gw = _make(EIGHT_DEVICES, _FlakyHub)
+
+    names = await gw.sync_device_names()
+
+    hub = gw._transport
+    assert isinstance(hub, _FlakyHub)
+    assert hub.requests == 2, "expected exactly one re-ask"
+    assert names == EIGHT_DEVICES
+
+
+async def test_a_truncated_batch_keeps_what_the_first_try_delivered() -> None:
+    """The buffer accumulates across attempts rather than restarting.
+
+    A hub that splits the batch across two answers must still yield the union.
+    Clearing the buffer on retry would silently discard the first half.
+    """
+    gw = _make(EIGHT_DEVICES, _HalfThenRestHub)
+
+    names = await gw.sync_device_names()
+
+    assert names == EIGHT_DEVICES
+
+
+async def test_a_complete_batch_is_not_re_asked() -> None:
+    """NAME_OVER ends it: the retry must not double every healthy sync."""
+    gw = _make(EIGHT_DEVICES)
+
+    await gw.sync_device_names()
+
+    hub = gw._transport
+    assert isinstance(hub, _NamingHub)
+    codes = [
+        obj["msg"]["CMD_CODE"] for obj in hub.sent if obj.get("action") == "APP_SEND"
+    ]
+    assert codes.count(24) == 1
+
+
+async def test_the_cap_bounds_every_attempt_together() -> None:
+    """The retry must not reset the absolute cap.
+
+    A per-attempt cap would let a hub that streams forever hold a Home Assistant
+    refresh for _NAME_ATTEMPTS x _NAME_MAX_SECONDS.
+    """
+    gw = _make({}, _EndlessHub, send_name_over=False)
+
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    await gw.sync_device_names()
+    elapsed = loop.time() - started
+
+    assert elapsed < gateway_mod._NAME_MAX_SECONDS * 1.5, (
+        "the cap was reset by the retry instead of bounding the whole operation"
+    )

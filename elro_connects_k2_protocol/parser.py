@@ -344,7 +344,11 @@ def parse_sub_device_info_response(
 ) -> SubDevice | None:
     """Parse a CMD_CODE 66 sub-device info response for a CO2/TH device.
 
-    CMD_CODE 66 is the response to a CMD_CODE 16 (sub-device info) request.
+    CMD_CODE 66 is the response to a CMD_CODE 16 (sub-device info) request, and
+    it has two payload shapes — ``ReceiveHandler.uploadSubDeviceInfo`` branches
+    on ``data_str2.length() == 30`` and treats anything else as a plain
+    deviceStatus string.
+
     For CO2/TH devices (type "018") it carries a 30-char ``data_str2`` that
     packs signal/battery/alarm followed by all three current measurements:
 
@@ -368,8 +372,13 @@ def parse_sub_device_info_response(
     second look-up and preserves any fields not present in this response.  If
     ``existing`` is ``None`` the type is inferred from ``data_str1[4:8]``.
 
-    Returns ``None`` if the response cannot be parsed (wrong length, bad
-    sub_id, missing fields).
+    Any other length is the short form: ``data_str2`` is a deviceStatus on its
+    own, carrying signal/battery/alarm and no measurements.  Every non-CO2/TH
+    device answers this way, and so does a CO2/TH slot with nothing paired into
+    it — the reference hub returns ``"FFFFFFFF"`` for one of those.
+
+    Returns ``None`` if the response cannot be parsed (too short for a status,
+    bad sub_id, missing fields).
     """
     msg: Any = obj.get("msg", obj)
     if not isinstance(msg, dict):
@@ -380,7 +389,7 @@ def parse_sub_device_info_response(
 
     if not isinstance(data_str1, str) or len(data_str1) < 4:
         return None
-    if not isinstance(data_str2, str) or len(data_str2) != 30:
+    if not isinstance(data_str2, str) or len(data_str2) < 6:
         return None
 
     try:
@@ -394,6 +403,17 @@ def parse_sub_device_info_response(
     device_type = existing.device_type if existing else normalize_type(raw_type)
     profile = existing.profile if existing else get_profile(device_type)
 
+    # Two payload shapes, exactly as ReceiveHandler.uploadSubDeviceInfo branches:
+    # a 30-char CO2/TH payload with tagged measurements, and anything else,
+    # which the app stores as a plain deviceStatus with no measurements.
+    #
+    # Only the 30-char form was implemented here, and the other branch returned
+    # None -- which left get_sub_device_info's future unresolved and every query
+    # to a non-CO2/TH device burning the full timeout despite the hub having
+    # answered instantly.  The reference hub returns the short form for its
+    # smoke alarms and for an empty CO2/TH slot alike.
+    is_measurement_payload = len(data_str2) == 30
+
     # The first 6 chars are signal/battery/alarm — decode_device_status
     # accepts any string of length ≥ 6, reading only the first 6 chars.
     signal, battery, alarm = decode_device_status(data_str2[0:6])
@@ -403,17 +423,23 @@ def parse_sub_device_info_response(
     humidity_pct: float | None = existing.humidity_pct if existing else None
 
     # Walk the three tagged measurement pairs at fixed positions.
-    for offset in (6, 12, 18):
-        result = decode_co2_th_measurement(data_str2[offset: offset + 6])
-        if result is None:
-            continue
-        field, value = result
-        if field == "temperature_c":
-            temperature_c = float(value)
-        elif field == "humidity_pct":
-            humidity_pct = float(value)
-        elif field == "co2_ppm":
-            co2_ppm = int(value)
+    if is_measurement_payload:
+        for offset in (6, 12, 18):
+            result = decode_co2_th_measurement(data_str2[offset: offset + 6])
+            if result is None:
+                continue
+            field, value = result
+            if field == "temperature_c":
+                temperature_c = float(value)
+            elif field == "humidity_pct":
+                humidity_pct = float(value)
+            elif field == "co2_ppm":
+                co2_ppm = int(value)
+
+    # The app keeps the 6-char prefix plus a synthetic "FF" for the measurement
+    # form, and stores the short form verbatim.  Mirrored here so raw_status
+    # stays comparable with what the vendor would have recorded.
+    raw_status = data_str2[0:6] + "FF" if is_measurement_payload else data_str2
 
     return SubDevice(
         sub_id=sub_id,
@@ -423,7 +449,7 @@ def parse_sub_device_info_response(
         signal_bars=signal,
         battery_pct=battery,
         alarm_state=alarm,
-        raw_status=data_str2[0:6] + "FF",
+        raw_status=raw_status,
         co2_ppm=co2_ppm,
         temperature_c=temperature_c,
         humidity_pct=humidity_pct,
@@ -530,16 +556,34 @@ def decode_device_name(data_str2: str) -> tuple[int, str] | None:
 
 
 def parse_gateway_info(obj: dict[str, Any]) -> GatewayInfo | None:
-    """Parse a CMD_CODE 13 gateway info response."""
+    """Parse a CMD_CODE 13 gateway info response.
+
+    ``data_str1`` is the Wi-Fi SSID as plain text — not hex, unlike almost every
+    other payload in this protocol.  ``data_str2`` packs two fields: ``[0:2]``
+    is the gateway room id and ``[2:]`` is the sub-device push flag, where
+    ``"00"`` means enabled.
+
+    Both fields are decoded leniently.  A hub that returns a shorter
+    ``data_str2`` than expected leaves the affected field ``None`` rather than
+    failing the whole parse, because the caller wants the SSID even from a hub
+    whose other fields it cannot read.
+    """
     msg: Any = obj.get("msg", obj)
     if not isinstance(msg, dict):
         return None
     device_name = obj.get("devID")
     if not isinstance(device_name, str):
         return None
+
+    data_str1 = str(msg.get("data_str1") or msg.get("rev_str1") or "")
+    data_str2 = str(msg.get("data_str2") or msg.get("rev_str2") or "")
+
     return GatewayInfo(
         device_name=device_name,
         ip="",  # caller fills this in from the packet source address
-        raw_data_str1=str(msg.get("data_str1") or msg.get("rev_str1") or ""),
-        raw_data_str2=str(msg.get("data_str2") or msg.get("rev_str2") or ""),
+        raw_data_str1=data_str1,
+        raw_data_str2=data_str2,
+        ssid=data_str1 or None,
+        room_id=data_str2[0:2] if len(data_str2) >= 2 else None,
+        sub_device_push=(data_str2[2:] == "00") if len(data_str2) > 2 else None,
     )
