@@ -39,6 +39,70 @@ Several things differed from the static-analysis hypothesis:
 
 6. **Source port 1025 is required.** Sending `APP_SEND` from an ephemeral port gets no response at all, not even `NODE_ACK`.
 
+7. **Most commands are never ACKed.** An `APP_SEND` does *not* reliably draw a `CMD_CODE 11`.
+   A parity run against the reference hub (2026-09-10, `tools/k2_app_parity.py`) sent 14 commands
+   — 9 × `CMD_CODE 54`, 3 × `24`, 2 × `12` — and received **zero** `CMD_CODE 11` frames. Every
+   command was answered directly with its data frame (`55`, `17`, `13`) or not at all. The one
+   code confirmed to ACK is `CMD_CODE 2`, whose ACK the app's `getAnswerResult` gates the pairing
+   countdown on; `CMD_CODE 1` is untested because it actuates a detector.
+
+   The consequence is diagnostic, not functional: **the absence of an ACK for a command proves
+   nothing about whether the hub processed it**, so it cannot distinguish an armed hub from a
+   deaf one. Use the data frame, or its absence, as the signal instead.
+
+### Gateway info payload (CMD_CODE 12 → 13)
+
+Confirmed against hardware 2026-09-10 and traced to the vendor app's own screens.
+
+| Field | Meaning | Source |
+| --- | --- | --- |
+| `data_str1` | The Wi-Fi SSID the hub is joined to, as **plain text** — not hex, unlike nearly every other payload in this protocol | `DeviceInfoActivity` binds it to `wifiName` and writes it back with CMD_CODE 77 |
+| `data_str2[0:2]` | Gateway room id | `MainFragment` slices it off and stores it via `updateGatewayRoom` before sending CMD_CODE 54 |
+| `data_str2[2:]` | Sub-device push flag; `"00"` = enabled | `GatewayDetailActivity`, which calls it `isEdgeGateway` |
+
+Observed on the reference hub: `data_str1 = "<home SSID>"`, `data_str2 = "0000"`.
+
+Two reasons this command matters more than its contents suggest:
+
+1. **It does not read the device table.** It is therefore the only query that distinguishes a hub
+   that is ignoring commands from one that is answering and has nothing paired — two states that
+   are otherwise identical on the wire, because the K2 has no "nothing to report" response (see
+   item 7 above, and the empty-result behaviour below).
+
+2. **The SSID is checkable ground truth.** A hub on a different Wi-Fi network or VLAN from the
+   controlling host is a common cause of "it never answers", and this is the only field that
+   reports what the hub actually joined rather than what its owner believes they configured.
+
+### Sub-device info has two payload shapes (CMD_CODE 16 → 66)
+
+`ReceiveHandler.uploadSubDeviceInfo` branches on `data_str2.length() == 30`:
+
+| `data_str2` | Meaning |
+| --- | --- |
+| exactly 30 chars | CO2/TH payload: 6-char status, then three tagged measurements, then a 6-char tail |
+| any other length | A plain `deviceStatus` string. No measurements. The app stores it verbatim |
+
+The short form is what **every non-CO2/TH device answers with**, and also what a CO2/TH slot with
+nothing paired into it returns — the reference hub answers `FFFFFFFF` for one of those and
+`0457AA7B` for a smoke alarm.
+
+A client that understands only the 30-char shape will appear to hang on the short one: the hub
+answers in about 12 ms and the client waits out its whole timeout. That was a real bug in this
+library, and because a status sync queries every CO2/TH device it cost a fixed 5 s on every
+refresh of a hub with one.
+
+Measured latency for this exchange on the reference hub: **8–17 ms across 12 queries, all
+answered**.
+
+### An empty result and a dropped request look identical
+
+Asked for a sub-device that does not exist (CMD_CODE 16 for an unused `sub_id`), a healthy, armed
+hub answers with **nothing at all** — no ACK, no error, no empty frame. Verified against hardware.
+
+So silence never means "no". A client that treats an empty status sync as "this hub has no
+detectors" will say that about a hub that simply never received the request. Ask CMD_CODE 12
+alongside it, and re-send anything unanswered before believing the silence.
+
 ### Name sync is a paced stream, not a request/response (CMD_CODE 24 → 17)
 
 `CMD_CODE 24` does not return a single answer. The hub replies with **one `CMD_CODE 17` frame per
@@ -50,10 +114,21 @@ literal `NAME_OVER`. Three consequences that are easy to get wrong:
    over 3 s to finish. A client that budgets a fixed wall-clock window for the whole batch will
    silently truncate its tail on any hub larger than the one it was tuned against.
 
-2. **The client cannot speed the stream up.** `ReceiveHandler.run` ACKs only `CMD_CODE 11`; name
-   frames are not acknowledged, so there is no per-frame handshake driving the hub forward. The
-   vendor app applies no timeout at all — it consumes frames until `NAME_OVER`, then fires
-   sync-finished event state `2`.
+2. **The client cannot speed the stream up.** The vendor app applies no timeout at all — it
+   consumes frames until `NAME_OVER`, then fires sync-finished event state `2`.
+
+   The reason given here previously — "`ReceiveHandler.run` ACKs only `CMD_CODE 11`" — was a
+   misreading and is wrong. `ReceiveHandler.sendAck` posts an internal EventBus event and never
+   touches the wire; `ReceiveHandler` sends nothing, ever. Every wire ACK comes from
+   `UdpControlProxy.onNodeSendDeal`, which ACKs **any** frame carrying a `msg_ID` — `CMD_CODE 17`
+   name frames included. So the app does acknowledge each name frame, exactly as this library
+   does.
+
+   That the pace is still not client-driven was checked directly rather than argued: a 6×6 A/B
+   run alternating our ACK (`rev_str1` = the acked code) against the app's (`rev_str1` always
+   `"11"`) found no difference in name count, completion or elapsed time. Both policies also
+   produced the same duplicate frames, and one *baseline* run returned no names at all — the
+   variation is the hub's, not the client's.
 
 3. **Unnamed sub-devices produce no frame — confirmed against hardware.** The hub only stores
    names that were explicitly set (`CMD_CODE 5`, `modifyEquipmentName`), so the frame count is the
@@ -450,7 +525,7 @@ UDP messages seen by `UdpControlProxy` contain `msg`; the probe should log the r
 | Code | Receiver method | Main fields | App behavior | HA mapping |
 | ---: | --- | --- | --- | --- |
 | 11 | `sendAck` | `data_str1`, `data_str2` | Emits `UPLOAD_ANSWER`. `CoderUtils.getAnswerResult` reads `data_str1[0:4]` as hex to get the command being acknowledged (it checks for a 9-char `data_str1`), and treats `data_str2 == "OK"` as success. Despite the method name nothing is sent. | Confirm a command was accepted — required before a pairing round starts. |
-| 13 | `uploadGatewayInfo` | `data_str1`, `data_str2` | Emits `UPLOAD_GATEWAY`. | Gateway diagnostics and settings. |
+| 13 | `uploadGatewayInfo` | `data_str1`, `data_str2` | Emits `UPLOAD_GATEWAY`. Fields decoded below. | Gateway diagnostics and settings; the only query that works on a hub with nothing paired. |
 | 17 | `uploadDeviceName` | `data_str2` | Updates sub-device names until `NAME_OVER`, then sync-finished event state `2`. | Device names. |
 | 19 | `uploadDeviceStatus` | `data_str1`, `data_str2` | Parses one device status update. | Realtime state/alarm updates. |
 | 26 | `uploadSceneInfo` | `data_str1`, `data_str2` | Syncs scene info, sync-finished event state `3`. | Optional scenes. |

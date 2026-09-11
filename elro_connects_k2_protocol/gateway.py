@@ -115,10 +115,11 @@ _SYNC_COLLECT_SECONDS: float = 3.0
 _NAME_RECORD_LEN: int = 36
 
 # Name sync is bounded by silence, not by a total budget.  The hub answers
-# CMD_CODE 24 with one CMD_CODE 17 frame per sub-device at its own pace (the
-# vendor app never ACKs those frames -- ReceiveHandler only ACKs CMD_CODE 11 --
-# so nothing we do speeds them up), terminated by NAME_OVER.  A fixed overall
-# budget therefore has to grow with the size of the device table, and silently
+# CMD_CODE 24 with one CMD_CODE 17 frame per sub-device at its own pace,
+# terminated by NAME_OVER, and nothing the client does speeds that up -- an A/B
+# run against the reference hub found no difference between ACKing each frame
+# with the acked code and with the app's fixed "11".  A fixed overall budget
+# therefore has to grow with the size of the device table, and silently
 # truncates the tail of the batch when it does not.  Waiting for a gap in the
 # stream instead makes the cost independent of device count.
 #
@@ -126,6 +127,12 @@ _NAME_RECORD_LEN: int = 36
 _NAME_IDLE_SECONDS: float = 2.0
 # Absolute cap on one name sync, so a hub that streams forever still returns.
 _NAME_MAX_SECONDS: float = 30.0
+# How many times to ask for names.  Measured on healthy hardware: 2 of 18 name
+# syncs ended without NAME_OVER -- one returned nothing at all, one stopped
+# after 2 of 3 records -- so roughly one in nine users silently loses nicknames
+# without a retry.  Records are keyed by sub_id, so a re-ask that repeats what
+# already arrived costs nothing.
+_NAME_ATTEMPTS: int = 2
 # How long to wait for the hub's CMD_CODE 11 ACK confirming a command was taken.
 _ACK_TIMEOUT: float = 5.0
 # How long to wait for the NODE_ACK confirming the hub processed an activation
@@ -133,9 +140,31 @@ _ACK_TIMEOUT: float = 5.0
 _ACTIVATION_TIMEOUT: float = 2.0
 # How many activation pings to send before giving up and sending anyway.
 _ACTIVATION_ATTEMPTS: int = 3
-# How many times to send CMD_CODE 54 when the hub returns no status records.
-# Only ever reached when activation went unacknowledged -- see sync_devices().
-_SYNC_ATTEMPTS: int = 2
+# How long to wait for a CMD_CODE 13 answer to a CMD_CODE 12 query.  Measured at
+# 10-30 ms on the reference hub, so 3.0 s is ~100x the observed latency.
+# Deliberately more generous than the sub-device timeout below despite being the
+# faster command: this answer is the signal that decides whether the user is
+# told their hub is ignoring commands or that it has nothing paired, and a false
+# "not answering" is a worse outcome than a slow refresh.
+_GATEWAY_INFO_TIMEOUT: float = 3.0
+# How long to wait for a CMD_CODE 66 answer to a CMD_CODE 16 query.  Measured
+# on the reference hub: 8-17 ms across 12 queries, every one answered.  2.0 s is
+# ~120x that, and still clears the slowest reply of any kind seen from this hub
+# (a 700 ms activation ack) by nearly 3x.
+#
+# It used to be 5.0 s, and it was paid in full on every refresh -- not because
+# the hub was slow but because parse_sub_device_info_response only understood
+# the 30-char CO2/TH payload and returned None for the short form, leaving the
+# future unresolved.  With both shapes handled this timeout should now be
+# unreachable in normal operation; it exists to bound the pathological case, not
+# to be waited on.
+_SUB_INFO_TIMEOUT: float = 2.0
+# How long to listen after a command before deciding nothing is coming and
+# re-sending it.  The vendor waits 1.0 s (UdpControlProxy.onResendMessage); the
+# reference hub answered CMD_CODE 54 in 26-105 ms in every measured exchange, so
+# this is generous by more than an order of magnitude and a retry that fires is
+# strong evidence the request or its reply was genuinely lost.
+_SYNC_RETRY_AFTER: float = 1.0
 # How long to hold a pairing window open.  Matches the vendor app's countdown
 # for adding a sub-device (DistributeNetRequest.onStartCountDown(false) → 60 s;
 # the 120 s branch is the gateway-onboarding flow, not this one).
@@ -168,9 +197,11 @@ class K2Gateway:
         self._devices: dict[int, SubDevice] = {}
         self._callbacks: list[UpdateCallback] = []
         self._msg_id: int = 0
-        # Sync state: set while CMD_CODE 54 is in flight
+        # Sync state: filled by _on_sync_response while CMD_CODE 54 is in
+        # flight.  There is no completion event to wait on -- the hub never
+        # signals that a status batch is finished -- so sync_devices times the
+        # collection window instead.
         self._sync_buffer: dict[int, SubDevice] = {}
-        self._sync_event: asyncio.Event | None = None
         # Name sync state: set while CMD_CODE 24 is in flight
         self._name_buffer: dict[int, str] = {}
         self._name_event: asyncio.Event | None = None
@@ -303,45 +334,70 @@ class K2Gateway:
     async def sync_devices(self) -> dict[int, SubDevice]:
         """Send CMD_CODE 54 and collect the CMD_CODE 55/56 responses.
 
-        Waits up to _SYNC_COLLECT_SECONDS for the K2 to finish sending
-        status records. Returns whatever was collected (may be partial if
-        the gateway is slow or the timeout is short).
+        Collection is a fixed window rather than a handshake: the hub sends its
+        status records at its own pace across one or more frames and never
+        signals that it is finished, so the only way to know the batch is
+        complete is to stop hearing from it.
+
+        A single re-send mirrors ``UdpControlProxy.onResendMessage``, which puts
+        the identical command on the wire again a second later if nothing has
+        come back.  UDP has no delivery guarantee and a lost request is
+        indistinguishable from a hub with nothing paired, so one cheap retry
+        buys a real reduction in false "no devices" reports.  It costs nothing
+        on the happy path: the retry only fires when the first second produced
+        no records at all, and the hub answered within 26-105 ms in every
+        measured exchange.
+
+        Deliberately *not* copied from the vendor: its retry is cancelled by a
+        flag on a process-wide singleton that any inbound frame sets, so on a
+        two-hub install the other hub's traffic silences the retry.  This tracks
+        one command at a time.
         """
         self._sync_buffer = {}
 
         crc = "00020000"
         tz = timezone_offset_code()
-        # A hub that never armed its session drops CMD_CODE 54 without a reply,
-        # so an empty buffer is indistinguishable from "no devices paired".
-        # Re-activate and re-ask rather than reporting zero devices on one miss;
-        # the buffer is keyed by sub_id, so a duplicate answer is harmless.
-        for attempt in range(1, _SYNC_ATTEMPTS + 1):
-            self._sync_event = asyncio.Event()
+
+        self._send(build_app_send(self._device_name, self._next_msg_id(), 54, crc, tz, ""))
+        _LOGGER.debug("Sent CMD_CODE 54 sync request")
+
+        # First a short listen, only long enough to tell "answering" from
+        # "silent" -- not to collect the whole batch.
+        await asyncio.sleep(_SYNC_RETRY_AFTER)
+
+        if self._sync_buffer:
+            # Answering.  Spend what is left of the budget collecting the rest,
+            # so the happy path still takes exactly _SYNC_COLLECT_SECONDS.
+            await asyncio.sleep(_SYNC_COLLECT_SECONDS - _SYNC_RETRY_AFTER)
+        else:
+            # Silent.  A hub that never armed drops CMD_CODE 54 without a trace,
+            # so re-arm before re-asking -- otherwise the retry is dropped for
+            # the same reason the first attempt was.
+            if not self._activated:
+                _LOGGER.debug(
+                    "No status records from %s and activation was never acked; "
+                    "re-activating before the retry", self._ip
+                )
+                await self.activate()
+            # A fresh msg_ID rather than the vendor's identical resend: if the
+            # *reply* was lost rather than the request, a hub that deduplicated
+            # on msg_ID would ignore a byte-identical retry.  No hub has been
+            # seen doing that -- the reference hub answers duplicates in full --
+            # but a fresh id costs nothing and does not depend on that holding.
             self._send(build_app_send(self._device_name, self._next_msg_id(), 54, crc, tz, ""))
             _LOGGER.debug(
-                "Sent CMD_CODE 54 sync request (attempt %d/%d)", attempt, _SYNC_ATTEMPTS
+                "No status records from %s within %.1f s; re-sent CMD_CODE 54",
+                self._ip, _SYNC_RETRY_AFTER,
             )
-
-            with contextlib.suppress(TimeoutError):
-                await asyncio.wait_for(self._sync_event.wait(), timeout=_SYNC_COLLECT_SECONDS)
-
-            self._sync_event = None
-            if self._sync_buffer or attempt == _SYNC_ATTEMPTS:
-                break
-            # An empty buffer after a *confirmed* activation is a real answer:
-            # the hub is armed and says it has no sub-devices paired, which is
-            # the normal state of a brand-new hub.  Retrying that just triples
-            # the time to report the truth, since nothing ever sets _sync_event
-            # and each attempt burns the full collect window.  Only retry when
-            # the activation went unacknowledged, because then the hub may
-            # never have armed and dropped the request without a trace.
-            if self._activated:
-                break
-            _LOGGER.debug(
-                "No CMD_CODE 55 records from %s and activation was never acked; "
-                "re-activating and retrying", self._ip
-            )
-            await self.activate()
+            await asyncio.sleep(_SYNC_COLLECT_SECONDS)
+            if not self._sync_buffer:
+                # Now meaningful: the hub was asked twice, re-armed in between if
+                # needed, and said nothing either time.
+                _LOGGER.debug(
+                    "Still no status records from %s after a re-send; the hub is "
+                    "either ignoring commands or has no sub-devices paired",
+                    self._ip,
+                )
 
         result = dict(self._sync_buffer)
         self._devices.update(result)
@@ -393,16 +449,75 @@ class K2Gateway:
         sub-device the owner never renamed produces no frame at all and that
         condition would never be satisfied.
 
+        An incomplete batch is retried once.  On healthy hardware 2 of 18
+        measured name syncs ended without NAME_OVER — one delivered nothing, one
+        stopped after 2 of 3 records — and the visible result is a detector
+        whose name never appears in Home Assistant, with nothing in the UI to
+        suggest a reload would fix it.  The buffer is keyed by sub_id and is
+        deliberately *not* cleared between attempts, so a batch split across two
+        tries still yields the union of both.
+
         Returns a sub_id → nickname mapping; empty dict if the hub has no
         custom names set or never answered.
         """
         self._name_buffer = {}
+        # One budget for the whole operation, not one per attempt.  A retry that
+        # reset the cap would let a hub that streams forever hold a Home
+        # Assistant refresh for _NAME_ATTEMPTS x _NAME_MAX_SECONDS, and the cap
+        # exists precisely to bound that.
+        overall_deadline = time.monotonic() + _NAME_MAX_SECONDS
+
+        complete = False
+        for attempt in range(1, _NAME_ATTEMPTS + 1):
+            complete = await self._collect_names(attempt, overall_deadline)
+            if complete:
+                break
+            if attempt < _NAME_ATTEMPTS:
+                if time.monotonic() >= overall_deadline:
+                    _LOGGER.debug(
+                        "CMD_CODE 24 hit the %.0f s cap; not re-asking", _NAME_MAX_SECONDS
+                    )
+                    break
+                _LOGGER.debug(
+                    "CMD_CODE 24 ended without NAME_OVER after %d nickname(s); re-asking",
+                    len(self._name_buffer),
+                )
+
+        result = dict(self._name_buffer)
+        if complete:
+            _LOGGER.debug("Name sync complete: %d nickname(s) found", len(result))
+        elif result:
+            # Partial results are indistinguishable from "the hub has no names
+            # set" to the caller, so say so loudly rather than at debug level.
+            _LOGGER.warning(
+                "CMD_CODE 24 name sync ended without NAME_OVER after %d attempt(s) "
+                "and %d nickname(s); the device list may be missing names",
+                _NAME_ATTEMPTS, len(result),
+            )
+        else:
+            _LOGGER.debug(
+                "CMD_CODE 24 name sync timed out after %d attempt(s) "
+                "(no CMD_CODE 17 frames received)", _NAME_ATTEMPTS,
+            )
+        return result
+
+    async def _collect_names(self, attempt: int, hard_deadline: float) -> bool:
+        """Send one CMD_CODE 24 and consume frames until NAME_OVER or silence.
+
+        Returns True when the hub sent NAME_OVER, i.e. the batch is known
+        complete.  Adds to ``self._name_buffer`` rather than replacing it, so
+        the caller can retry and keep whatever the earlier attempt delivered.
+
+        ``hard_deadline`` is a monotonic timestamp shared by every attempt, so
+        the cap bounds the whole operation rather than each try.
+        """
         self._name_event = asyncio.Event()
         self._name_last_frame = time.monotonic()
-        hard_deadline = self._name_last_frame + _NAME_MAX_SECONDS
 
         self._send(build_app_send(self._device_name, self._next_msg_id(), 24, "00020000", "", ""))
-        _LOGGER.debug("Sent CMD_CODE 24 name sync request")
+        _LOGGER.debug(
+            "Sent CMD_CODE 24 name sync request (attempt %d/%d)", attempt, _NAME_ATTEMPTS
+        )
 
         complete = False
         while True:
@@ -423,19 +538,7 @@ class K2Gateway:
             break
 
         self._name_event = None
-        result = dict(self._name_buffer)
-        if complete:
-            _LOGGER.debug("Name sync complete: %d nickname(s) found", len(result))
-        elif result:
-            # Partial results are indistinguishable from "the hub has no names
-            # set" to the caller, so say so loudly rather than at debug level.
-            _LOGGER.warning(
-                "CMD_CODE 24 name sync ended without NAME_OVER after %d nickname(s); "
-                "the device list may be missing names", len(result),
-            )
-        else:
-            _LOGGER.debug("CMD_CODE 24 name sync timed out (no CMD_CODE 17 frames received)")
-        return result
+        return complete
 
     def send_device_action(self, sub_id: int, action: str) -> None:
         """Send CMD_CODE 1 to trigger a device action (test, mute/silence, etc.).
@@ -450,8 +553,12 @@ class K2Gateway:
         ``DeviceProfile.mute_action``; the profiles are the single source of
         truth so callers never need to hardcode them.
 
-        Fire-and-forget: no ACK or response is expected from the K2 beyond the
-        standard CMD_CODE 11 ACK that the gateway emits for all APP_SEND frames.
+        Fire-and-forget: nothing is awaited, and on the reference hub nothing
+        comes back.  A CMD_CODE 11 ACK is *not* guaranteed — see ``_on_ack``,
+        where a hardware run found that hub answering CMD_CODE 12, 24 and 54
+        with their data frames and never with an ACK.  CMD_CODE 1 was not part
+        of that run (it actuates a real detector), so treat "no ACK" as the
+        expectation here rather than as a symptom.
         """
         sub_id_hex = f"{sub_id:04X}"
         self._send(build_app_send(
@@ -469,8 +576,12 @@ class K2Gateway:
         self._pending_gateway_info = future
         self._send(build_app_send(self._device_name, self._next_msg_id(), 12, "00", "00", ""))
         try:
-            return await asyncio.wait_for(future, timeout=5.0)
+            return await asyncio.wait_for(future, timeout=_GATEWAY_INFO_TIMEOUT)
         except TimeoutError:
+            _LOGGER.debug(
+                "No CMD_CODE 13 from %s within %.1f s; the hub is not answering commands",
+                self._ip, _GATEWAY_INFO_TIMEOUT,
+            )
             return None
         finally:
             self._pending_gateway_info = None
@@ -499,9 +610,12 @@ class K2Gateway:
         self._send(build_app_send(self._device_name, self._next_msg_id(), 16, sub_id_hex, "", ""))
         _LOGGER.debug("Sent CMD_CODE 16 sub-device info request for sub_id=%d", sub_id)
         try:
-            return await asyncio.wait_for(future, timeout=5.0)
+            return await asyncio.wait_for(future, timeout=_SUB_INFO_TIMEOUT)
         except TimeoutError:
-            _LOGGER.debug("CMD_CODE 66 response timed out for sub_id=%d", sub_id)
+            _LOGGER.debug(
+                "CMD_CODE 66 response timed out for sub_id=%d after %.1f s",
+                sub_id, _SUB_INFO_TIMEOUT,
+            )
             return None
         finally:
             self._pending_sub_info.pop(sub_id, None)
@@ -848,7 +962,20 @@ class K2Gateway:
         ``CoderUtils.getAnswerResult`` before letting a pairing round proceed.
 
         ACKs for commands nobody is waiting on are ignored; most commands here
-        are fire-and-forget and every APP_SEND draws one of these.
+        are fire-and-forget.
+
+        **An APP_SEND does not reliably draw an ACK.**  A parity run against the
+        reference hub (``tools/k2_app_parity.py``, 2026-09-10) sent 14 commands
+        — 9 × CMD_CODE 54, 3 × 24, 2 × 12 — and received zero CMD_CODE 11 frames
+        in reply.  Each command was answered directly with its data frame (55,
+        17, 13) or not at all.  CMD_CODE 2 is the one code confirmed to ACK, via
+        the app's own ``getAnswerResult`` gate on the pairing countdown, and
+        ``start_pairing`` is the only caller that awaits one.
+
+        This matters mainly as a diagnostic: the *absence* of an ACK for
+        CMD_CODE 54 says nothing about whether the hub processed it, so it
+        cannot be used to tell an armed hub from a deaf one.  Nothing in the
+        sync path depends on the ACK, so there is no behavioural bug here.
         """
         msg: Any = obj.get("msg", obj)
         if not isinstance(msg, dict):

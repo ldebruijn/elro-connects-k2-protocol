@@ -33,7 +33,12 @@ elro_connects_k2_protocol/
   protocol.py        XOR framing, encrypt/decrypt, message builders
   __main__.py        CLI: sync / listen / gateway-info / pair
 tests/               Fixture-driven; tests/fixtures/*.json hold real captured payloads
-tools/k2_simulator.py  Fake hub — sends real UDP packets, nothing mocked
+tools/k2_simulator.py  Fake hub that *pushes* — sends real UDP packets on a schedule
+tools/k2_hub_responder.py  Fake hub that *answers* — request/response, with switchable
+                       firmware quirks (--quirk deaf / require-cmd12 / ...) for
+                       reproducing reported failures and validating the harness below
+tools/k2_app_parity.py  Checks that vendor-app-faithful session variants still work on a
+                       real hub; one healthy hub is enough to clear a change
 tools/k2_udp_probe.py  Stdlib-only wire probe for raw exploration
 tools/name_sync_report.py  Pasteable nickname-sync report for bug reports; also
                        validates a name against the encoder via --check-name
@@ -51,6 +56,8 @@ JSON file with `input` / `expected` keys into `tests/fixtures/` adds it to the p
 automatically — no test code to write. Prefer adding a fixture over adding a test function.
 
 Develop without hardware via `python tools/k2_simulator.py` — it exercises the real parse path.
+For anything that depends on what the hub *says back* (session order, activation, retries), use
+`tools/k2_hub_responder.py` instead; the simulator never answers.
 
 ## Norms
 

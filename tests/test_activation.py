@@ -162,21 +162,22 @@ async def test_sync_is_not_sent_before_the_hub_arms() -> None:
     assert sorted(devices) == [1, 2]
 
 
-async def test_unguarded_activation_loses_the_race(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Guards the fake hub itself: without the gate the sync really is dropped.
+async def test_unguarded_activation_loses_the_race() -> None:
+    """Guards the fake hub itself: without the gate the first sync really is dropped.
 
-    If this ever stops failing to find devices, _FakeHub has stopped modelling
-    the bug and the tests above would no longer prove anything.  The retry
-    safety net is disabled here to isolate the race.
+    If ``dropped`` ever comes back empty, _FakeHub has stopped modelling the bug
+    and the tests above would no longer prove anything.
+
+    Only the drop is asserted here.  The re-send in sync_devices recovers the
+    sync afterwards, which is deliberate and is what
+    test_retry_recovers_when_activation_was_never_confirmed covers.
     """
-    monkeypatch.setattr(gateway_mod, "_SYNC_ATTEMPTS", 1)
     gw, hub = _gateway()
 
     _fire_and_forget_activation(gw)
-    devices = await gw.sync_devices()
+    await gw.sync_devices()
 
     assert hub.dropped == [54], "expected the un-armed hub to discard CMD_CODE 54"
-    assert devices == {}
 
 
 async def test_retry_recovers_when_activation_was_never_confirmed() -> None:
@@ -213,11 +214,18 @@ async def test_activation_retries_then_gives_up_without_hanging() -> None:
     assert gw._activated is False
 
 
-async def test_empty_sync_on_an_armed_hub_is_not_retried() -> None:
-    """A hub with nothing paired is a real answer, not a failure to retry.
+async def test_empty_sync_on_an_armed_hub_is_re_asked_once() -> None:
+    """Silence is not proof of an empty hub, so ask twice before believing it.
 
-    Retrying it would multiply the time to report the truth, because nothing
-    ever sets _sync_event and each attempt burns the whole collect window.
+    A K2 has no "nothing to report" response: asked about a sub-device that does
+    not exist, a healthy hub answers with nothing at all, exactly as a hub that
+    is ignoring commands would.  So an empty first answer cannot be taken at
+    face value, and the vendor app re-sends any unanswered command a second
+    later.  Two asks, then report empty.
+
+    Asserting the count matters in both directions -- a third ask would mean the
+    retry had become a loop, and a first-and-only ask would mean a dropped
+    datagram still surfaces as "this hub has no detectors".
     """
     gw, hub = _gateway()
     gw._activated = True
@@ -227,4 +235,4 @@ async def test_empty_sync_on_an_armed_hub_is_not_retried() -> None:
     devices = await gw.sync_devices()
 
     assert devices == {}
-    assert hub.app_send_codes().count(54) == 1
+    assert hub.app_send_codes().count(54) == 2

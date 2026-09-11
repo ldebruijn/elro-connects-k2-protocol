@@ -102,8 +102,31 @@ class PairingResult:
 
 @dataclass
 class GatewayInfo:
+    """What the hub reports about itself, from a CMD_CODE 12 → 13 exchange.
+
+    ``ssid`` is the Wi-Fi network the hub is currently joined to, in plain text.
+    It is worth more than it looks: a hub on a different SSID or VLAN from Home
+    Assistant is a common cause of "the hub never answers", and until this field
+    was decoded the only source for it was asking the owner — who reports what
+    they configured, not what the hub actually did.  The vendor app shows this
+    same value on its gateway-detail screen and writes it back with CMD_CODE 77
+    (``DeviceInfoActivity``).
+
+    ``room_id`` and ``sub_device_push`` are the two halves of ``data_str2``.
+    The app slices ``[0:2]`` off as the gateway's room before it will send a
+    status sync, and reads ``[2:]`` as the sub-device push flag — ``"00"`` means
+    enabled, which it calls ``isEdgeGateway`` (``GatewayDetailActivity``).
+
+    The raw fields are kept alongside the decoded ones because the decoding is
+    only as good as the two hubs it was derived from, and a diagnostics dump
+    that carries the original strings can be re-read later without a new capture.
+    """
+
     device_name: str
     ip: str
     product_key: str = "a2AdG2E0EHL"
     raw_data_str1: str = ""
     raw_data_str2: str = ""
+    ssid: str | None = None
+    room_id: str | None = None
+    sub_device_push: bool | None = None
